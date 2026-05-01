@@ -3180,3 +3180,5 @@ source "arch/x86/kvm/Kconfig"
 source "arch/x86/Kconfig.cpufeatures"
 
 source "arch/x86/Kconfig.assembler"
+
+source "kernel/moker/Kconfig"

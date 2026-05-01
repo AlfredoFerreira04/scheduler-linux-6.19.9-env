@@ -98,8 +98,11 @@ static void update_curr_stop(struct rq *rq)
  */
 DEFINE_SCHED_CLASS(stop) = {
 
+#ifdef CONFIG_MOKER_EDF_CBS_POLICY
+	.queue_mask		= 32,
+#else
 	.queue_mask		= 16,
-
+#endif
 	.enqueue_task		= enqueue_task_stop,
 	.dequeue_task		= dequeue_task_stop,
 	.yield_task		= yield_task_stop,

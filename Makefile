@@ -2,7 +2,7 @@
 VERSION = 6
 PATCHLEVEL = 19
 SUBLEVEL = 9
-EXTRAVERSION =
+EXTRAVERSION = -moker-edf-cbs-0.1.0
 NAME = Baby Opossum Posse
 
 # *DOCUMENTATION*

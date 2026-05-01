@@ -150,6 +150,20 @@
  * used to determine the order of the priority of each sched class in
  * relation to each other.
  */
+
+#ifdef CONFIG_MOKER_EDF_CBS_POLICY
+#define SCHED_DATA				\
+	STRUCT_ALIGN();				\
+	__sched_class_highest = .;		\
+	*(__stop_sched_class)			\
+	*(__edf_cbs_sched_class)			\
+	*(__dl_sched_class)			\
+	*(__rt_sched_class)			\
+	*(__fair_sched_class)			\
+	*(__ext_sched_class)			\
+	*(__idle_sched_class)			\
+	__sched_class_lowest = .;
+#else
 #define SCHED_DATA				\
 	STRUCT_ALIGN();				\
 	__sched_class_highest = .;		\
@@ -160,7 +174,7 @@
 	*(__ext_sched_class)			\
 	*(__idle_sched_class)			\
 	__sched_class_lowest = .;
-
+#endif
 /* The actual configuration determine if the init/exit sections
  * are handled as text/data or they can be discarded (which
  * often happens at runtime)

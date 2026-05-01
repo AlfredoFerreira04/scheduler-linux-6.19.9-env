@@ -1,0 +1,13 @@
+menu "MOKER framework"
+config MOKER_FRAMEWORK
+bool "My Own KErnel Framework"
+default y
+config MOKER_TRACING
+bool "MOKER tracing"
+default y
+depends on MOKER_FRAMEWORK
+config MOKER_EDF_CBS_POLICY
+bool "MOKER EDF CBS Policy"
+default n
+depends on MOKER_FRAMEWORK
+endmenu

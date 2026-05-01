@@ -92,6 +92,16 @@ struct cpuidle_state;
 #include "cpupri.h"
 #include "cpudeadline.h"
 
+#ifdef CONFIG_MOKER_TRACING
+#include "../moker/trace.h"
+#endif
+
+#ifdef CONFIG_MOKER_EDF_CBS_POLICY
+#include "../moker/edf_cbs_task.h"
+extern const struct sched_class edf_cbs_sched_class;
+#include "../moker/edf_cbs_rq.h"
+#endif
+
 /* task_struct::on_rq states: */
 #define TASK_ON_RQ_QUEUED	1
 #define TASK_ON_RQ_MIGRATING	2
@@ -212,10 +222,21 @@ static inline int dl_policy(int policy)
 	return policy == SCHED_DEADLINE;
 }
 
+#ifdef CONFIG_MOKER_EDF_CBS_POLICY
+static inline int edf_cbs_policy(int policy)
+{
+	return policy == SCHED_EDF_CBS;
+}
+#endif
+
 static inline bool valid_policy(int policy)
 {
 	return idle_policy(policy) || fair_policy(policy) ||
-		rt_policy(policy) || dl_policy(policy);
+		rt_policy(policy) || dl_policy(policy)
+	#ifdef CONFIG_MOKER_EDF_CBS_POLICY
+		|| edf_cbs_policy(policy)
+	#endif
+		;
 }
 
 static inline int task_has_idle_policy(struct task_struct *p)
@@ -1149,6 +1170,12 @@ struct rq {
 	struct cfs_rq		cfs;
 	struct rt_rq		rt;
 	struct dl_rq		dl;
+
+#ifdef CONFIG_MOKER_EDF_CBS_POLICY
+	struct edf_cbs_rq	edf_cbs;
+#endif
+
+
 #ifdef CONFIG_SCHED_CLASS_EXT
 	struct scx_rq		scx;
 #endif
