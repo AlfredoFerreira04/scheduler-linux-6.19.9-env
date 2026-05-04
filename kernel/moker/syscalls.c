@@ -60,6 +60,7 @@ int do_delay_edf_cbs_task_until_next_T(void){
 #ifdef CONFIG_MOKER_EDF_CBS_POLICY
 
 	// Gets absolute deadline and sets a timeout to it
+	// returns 1 if deadline had passed already, returns 0 if waited
 	// This basically moves the task to the waitqueue by sleeping it
 	// Then wakes it up with hrtimer precision upon deadline expiring
 	// https://elixir.bootlin.com/linux/v6.19/source/kernel/time/sleep_timeout.c#L227
@@ -72,11 +73,21 @@ int do_delay_edf_cbs_task_until_next_T(void){
 
 		refresh_task_deadline(current);
 
+		ktime_t now = ktime_get();
+
+		if (ktime_compare(expires, now) <= 0) {
+			current->edf_cbs.deadlineUpdate = true;
+			set_tsk_need_resched(current);
+			return 1;
+		}
+
 		set_current_state(TASK_INTERRUPTIBLE);
 		schedule_hrtimeout(&expires, HRTIMER_MODE_ABS);
-		__set_current_state(TASK_RUNNING);		
+		__set_current_state(TASK_RUNNING);	
 
-		u64 now = ktime_get_ns();
+
+		// Debugging purposes
+		now = ktime_get_ns();
 		s64 delta = (s64)(current->edf_cbs.absDL - now);
 
 		printk(KERN_INFO "delay enter id=%u now=%llu absDL=%llu delta=%lld state=%u\n",
@@ -84,6 +95,6 @@ int do_delay_edf_cbs_task_until_next_T(void){
 	}
 
 #endif
-	return 1;
+	return 0;
 }
 

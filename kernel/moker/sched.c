@@ -133,6 +133,16 @@ static struct task_struct *pick_next_task_edf_cbs(struct rq *rq,
 						  struct task_struct *prev,
 						  struct rq_flags *rf)
 {
+
+	// re-balancing the rbtree via reinsertion.
+	// no need to grab the lock here since the
+	// individual functions already do so.
+	if(prev->edf_cbs.deadlineUpdate == true){
+		dequeue_task_edf_cbs(rq, prev, 0);
+		enqueue_task_edf_cbs(rq, prev, 0);
+		prev->edf_cbs.deadlineUpdate = false;
+	}
+
 	struct task_struct *task = NULL;
 	struct rb_node *first;
 
