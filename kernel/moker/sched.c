@@ -3,20 +3,15 @@
 #include <linux/spinlock.h>
 #include <linux/types.h>
 
-static void enqueue_task_edf_cbs(struct rq *rq, struct task_struct *p, int flags)
+static void __insert_edf_tree(struct rq *rq, struct task_struct *p)
 {
 	struct rb_root *root = &rq->edf_cbs.tasks_tree;
 	struct rb_node **link = &root->rb_node;
 	struct rb_node *parent = NULL;
-	struct rb_node *first;
-	struct sched_edf_cbs_entity *sched_entity = &p->edf_cbs;
+	struct sched_edf_cbs_entity *se = &p->edf_cbs;
 
-	raw_spin_lock(&rq->edf_cbs.lock);
-
-	if (!RB_EMPTY_NODE(&sched_entity->node)) {
-		raw_spin_unlock(&rq->edf_cbs.lock);
+	if (!RB_EMPTY_NODE(&se->node))
 		return;
-	}
 
 	while (*link) {
 		struct sched_edf_cbs_entity *entry;
@@ -24,27 +19,106 @@ static void enqueue_task_edf_cbs(struct rq *rq, struct task_struct *p, int flags
 		entry = rb_entry(*link, struct sched_edf_cbs_entity, node);
 		parent = *link;
 
-		if (sched_entity->absDL < entry->absDL)
+		if (se->absDL < entry->absDL)
 			link = &(*link)->rb_left;
 		else
 			link = &(*link)->rb_right;
 	}
 
-	rb_link_node(&sched_entity->node, parent, link);
-	rb_insert_color(&sched_entity->node, root);
+	rb_link_node(&se->node, parent, link);
+	rb_insert_color(&se->node, root);
 
-	first = rb_first(root);
+	add_nr_running(rq, 1);
+}
+
+static void __update_edf_pick(struct rq *rq)
+{
+	struct rb_node *first = rb_first(&rq->edf_cbs.tasks_tree);
+
 	if (first) {
 		struct sched_edf_cbs_entity *first_entity;
 
 		first_entity = rb_entry(first, struct sched_edf_cbs_entity, node);
-		rq->edf_cbs.task = container_of(first_entity, struct task_struct, edf_cbs);
+		rq->edf_cbs.task = container_of(first_entity,
+						struct task_struct,
+						edf_cbs);
 	} else {
 		rq->edf_cbs.task = NULL;
 	}
+}
 
-	add_nr_running(rq, 1);
+static void enqueue_hard_rt_task(struct rq *rq, struct task_struct *p)
+{
+	__insert_edf_tree(rq, p);
+	__update_edf_pick(rq);
+}
 
+static void enqueue_soft_rt_task(struct rq *rq, struct task_struct *p)
+{
+	struct cbs_server *server;
+	struct cbs_queue *member;
+	struct cbs_queue *iter;
+	bool was_empty;
+
+	server = lookup_cbs_server(&rq->edf_cbs, p->edf_cbs.cbs_server_id);
+	if (!server)
+		return;
+
+	/*
+	 * Already the active task for this server.
+	 * Nothing to enqueue.
+	 */
+	if (server->curr == p)
+		return;
+
+	/*
+	 * Avoid duplicate FIFO entries for the same task.
+	 */
+	list_for_each_entry(iter, &server->queue_head, node) {
+		if (iter->task == p)
+			return;
+	}
+
+	was_empty = list_empty(&server->queue_head) && server->curr == NULL;
+
+	member = kmalloc(sizeof(*member), GFP_ATOMIC);
+	if (!member)
+		return;
+
+	member->task = p;
+	INIT_LIST_HEAD(&member->node);
+
+	list_add_tail(&member->node, &server->queue_head);
+
+	if (was_empty) {
+		struct cbs_queue *first;
+		struct task_struct *next;
+
+		first = list_first_entry(&server->queue_head,
+					 struct cbs_queue,
+					 node);
+		next = first->task;
+
+		list_del(&first->node);
+		kfree(first);
+
+		server->curr = next;
+		next->edf_cbs.absDL = server->absDL;
+
+		__insert_edf_tree(rq, next);
+		__update_edf_pick(rq);
+	}
+}
+
+static void enqueue_task_edf_cbs(struct rq *rq, struct task_struct *p, int flags)
+{	
+	raw_spin_lock(&rq->edf_cbs.lock);
+
+	if(p->edf_cbs.isHardRT == true)	
+		enqueue_hard_rt_task(rq, p);
+	else
+		enqueue_soft_rt_task(rq, p);
+	
 	raw_spin_unlock(&rq->edf_cbs.lock);
 
 #ifdef CONFIG_MOKER_TRACING
@@ -54,25 +128,81 @@ static void enqueue_task_edf_cbs(struct rq *rq, struct task_struct *p, int flags
 
 static bool dequeue_task_edf_cbs(struct rq *rq, struct task_struct *p, int flags)
 {
-	struct rb_node *first;
-
 	raw_spin_lock(&rq->edf_cbs.lock);
 
-	if (!RB_EMPTY_NODE(&p->edf_cbs.node)) {
-		rb_erase(&p->edf_cbs.node, &rq->edf_cbs.tasks_tree);
-		RB_CLEAR_NODE(&p->edf_cbs.node);
-		sub_nr_running(rq, 1);
-	}
+	if (!p->edf_cbs.isHardRT) {
+		struct cbs_server *server;
+		struct cbs_queue *entry, *tmp;
+		bool was_curr = false;
 
-	first = rb_first(&rq->edf_cbs.tasks_tree);
-	if (first) {
-		struct sched_edf_cbs_entity *first_entity;
+		server = lookup_cbs_server(&rq->edf_cbs,
+					   p->edf_cbs.cbs_server_id);
 
-		first_entity = rb_entry(first, struct sched_edf_cbs_entity, node);
-		rq->edf_cbs.task = container_of(first_entity, struct task_struct, edf_cbs);
+		if (server) {
+			/*
+			 * If p is currently active for this server, clear curr.
+			 */
+			if (server->curr == p) {
+				server->curr = NULL;
+				was_curr = true;
+			}
+
+			/*
+			 * Remove p from EDF tree if it is there.
+			 * This must happen even if server->curr != p,
+			 * because soft sleep paths may clear curr before
+			 * scheduler dequeue happens.
+			 */
+			if (!RB_EMPTY_NODE(&p->edf_cbs.node)) {
+				rb_erase(&p->edf_cbs.node,
+					 &rq->edf_cbs.tasks_tree);
+				RB_CLEAR_NODE(&p->edf_cbs.node);
+				sub_nr_running(rq, 1);
+			}
+
+			/*
+			 * Remove p from server FIFO if it is waiting there.
+			 */
+			list_for_each_entry_safe(entry, tmp,
+						 &server->queue_head, node) {
+				if (entry->task == p) {
+					list_del(&entry->node);
+					kfree(entry);
+					break;
+				}
+			}
+
+			/*
+			 * Promote next FIFO task if this dequeue freed the server.
+			 */
+			if ((was_curr || server->curr == NULL) &&
+			    !list_empty(&server->queue_head)) {
+				struct cbs_queue *next_entry;
+				struct task_struct *next;
+
+				next_entry = list_first_entry(&server->queue_head,
+							      struct cbs_queue,
+							      node);
+				next = next_entry->task;
+
+				list_del(&next_entry->node);
+				kfree(next_entry);
+
+				server->curr = next;
+				next->edf_cbs.absDL = server->absDL;
+
+				__insert_edf_tree(rq, next);
+			}
+		}
 	} else {
-		rq->edf_cbs.task = NULL;
+		if (!RB_EMPTY_NODE(&p->edf_cbs.node)) {
+			rb_erase(&p->edf_cbs.node, &rq->edf_cbs.tasks_tree);
+			RB_CLEAR_NODE(&p->edf_cbs.node);
+			sub_nr_running(rq, 1);
+		}
 	}
+
+	__update_edf_pick(rq);
 
 	raw_spin_unlock(&rq->edf_cbs.lock);
 
@@ -123,7 +253,33 @@ static struct task_struct *pick_task_edf_cbs(struct rq *rq, struct rq_flags *rf)
 	struct task_struct *task;
 
 	raw_spin_lock(&rq->edf_cbs.lock);
+
 	task = rq->edf_cbs.task;
+
+	if (task && task->edf_cbs.isHardRT == false) {
+		struct cbs_server *server;
+
+		server = lookup_cbs_server(&rq->edf_cbs,
+					   task->edf_cbs.cbs_server_id);
+
+		if (server &&
+		    server->curr == task &&
+		    server->currCapacity > 0 &&
+		    !hrtimer_active(&server->capacityTimer)) {
+			ktime_t now;
+			ktime_t expires;
+
+			now = ktime_get();
+			server->capacityTimerStart = now;
+
+			expires = ktime_add_ns(now, server->currCapacity);
+
+			hrtimer_start(&server->capacityTimer,
+				      expires,
+				      HRTIMER_MODE_ABS);
+		}
+	}
+
 	raw_spin_unlock(&rq->edf_cbs.lock);
 
 	return task;
@@ -133,31 +289,26 @@ static struct task_struct *pick_next_task_edf_cbs(struct rq *rq,
 						  struct task_struct *prev,
 						  struct rq_flags *rf)
 {
+	struct task_struct *task;
 
-	// re-balancing the rbtree via reinsertion.
-	// no need to grab the lock here since the
-	// individual functions already do so.
-	if(prev->edf_cbs.deadlineUpdate == true){
-		dequeue_task_edf_cbs(rq, prev, 0);
-		enqueue_task_edf_cbs(rq, prev, 0);
+	if (prev &&
+	    prev->policy == SCHED_EDF_CBS &&
+	    prev->edf_cbs.deadlineUpdate) {
+		bool still_running;
+
 		prev->edf_cbs.deadlineUpdate = false;
-	}
+		still_running = READ_ONCE(prev->__state) == TASK_RUNNING;
 
-	struct task_struct *task = NULL;
-	struct rb_node *first;
+		dequeue_task_edf_cbs(rq, prev, 0);
+
+		if (still_running)
+			enqueue_task_edf_cbs(rq, prev, 0);
+	}
 
 	raw_spin_lock(&rq->edf_cbs.lock);
 
-	first = rb_first(&rq->edf_cbs.tasks_tree);
-	if (first) {
-		struct sched_edf_cbs_entity *picked_entity;
-
-		picked_entity = rb_entry(first, struct sched_edf_cbs_entity, node);
-		task = container_of(picked_entity, struct task_struct, edf_cbs);
-		rq->edf_cbs.task = task;
-	} else {
-		rq->edf_cbs.task = NULL;
-	}
+	__update_edf_pick(rq);
+	task = rq->edf_cbs.task;
 
 	raw_spin_unlock(&rq->edf_cbs.lock);
 

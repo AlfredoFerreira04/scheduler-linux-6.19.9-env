@@ -12,8 +12,9 @@ struct sched_edf_cbs_entity {
 	u64 relDL;          	/* relative deadline / period */
 	u64 absDL;          	/* absolute deadline */
 
-	bool deadlineUpdate;	 /* flag to update DL on enqueue */
+	bool deadlineUpdate;	/* flag to update DL on enqueue */
 
 	bool isHardRT;			/* distinguish between soft and hard RT tasks*/
+	u32  cbs_server_id;		/* associated server id for soft RT tasks */
 };
 #endif
