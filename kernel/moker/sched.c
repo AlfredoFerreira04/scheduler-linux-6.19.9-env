@@ -1,57 +1,15 @@
 #include "../sched/sched.h"
-#include <linux/rbtree.h>
-#include <linux/spinlock.h>
-#include <linux/types.h>
+#include "utils.h"
 
-static void __insert_edf_tree(struct rq *rq, struct task_struct *p)
-{
-	struct rb_root *root = &rq->edf_cbs.tasks_tree;
-	struct rb_node **link = &root->rb_node;
-	struct rb_node *parent = NULL;
-	struct sched_edf_cbs_entity *se = &p->edf_cbs;
-
-	if (!RB_EMPTY_NODE(&se->node))
-		return;
-
-	while (*link) {
-		struct sched_edf_cbs_entity *entry;
-
-		entry = rb_entry(*link, struct sched_edf_cbs_entity, node);
-		parent = *link;
-
-		if (se->absDL < entry->absDL)
-			link = &(*link)->rb_left;
-		else
-			link = &(*link)->rb_right;
-	}
-
-	rb_link_node(&se->node, parent, link);
-	rb_insert_color(&se->node, root);
-
-	add_nr_running(rq, 1);
-}
-
-static void __update_edf_pick(struct rq *rq)
-{
-	struct rb_node *first = rb_first(&rq->edf_cbs.tasks_tree);
-
-	if (first) {
-		struct sched_edf_cbs_entity *first_entity;
-
-		first_entity = rb_entry(first, struct sched_edf_cbs_entity, node);
-		rq->edf_cbs.task = container_of(first_entity,
-						struct task_struct,
-						edf_cbs);
-	} else {
-		rq->edf_cbs.task = NULL;
-	}
-}
+#define DEQUEUE_UPDATE_DEADLINE 0x10000000
 
 static void enqueue_hard_rt_task(struct rq *rq, struct task_struct *p)
 {
-	__insert_edf_tree(rq, p);
-	__update_edf_pick(rq);
+	insert_edf_tree(rq, p);
+	update_edf_pick(rq);
 }
+
+
 
 static void enqueue_soft_rt_task(struct rq *rq, struct task_struct *p)
 {
@@ -59,20 +17,65 @@ static void enqueue_soft_rt_task(struct rq *rq, struct task_struct *p)
 	struct cbs_queue *member;
 	struct cbs_queue *iter;
 	bool was_empty;
+	u64 now_ns;
 
 	server = lookup_cbs_server(&rq->edf_cbs, p->edf_cbs.cbs_server_id);
 	if (!server)
 		return;
 
 	/*
-	 * Already the active task for this server.
-	 * Nothing to enqueue.
+	 * First activation of this CBS server.
+	 * This must happen before promotion, otherwise the first soft task
+	 * sees currCapacity == 0 and never becomes server->curr.
 	 */
-	if (server->curr == p)
-		return;
+	if (server->absDL == 0) {
+		now_ns = ktime_get_ns();
+
+		server->absDL = now_ns + server->relDL;
+		server->currCapacity = server->maximumCapacity;
+		server->capacity_active = false;
+
+		p->edf_cbs.absDL = server->absDL;
+
+		hrtimer_start(&server->deadlineTimer,
+			      ns_to_ktime(server->absDL),
+			      HRTIMER_MODE_ABS);
+
+		printk(KERN_INFO
+		       "[%llu ms] CBS deadline init: server=%p task=%d mid=%u absDL=%llu relDL=%llu cap=%llu\n",
+		       now_ns / 1000000ULL,
+		       server,
+		       p->pid,
+		       p->edf_cbs.id,
+		       server->absDL,
+		       server->relDL,
+		       server->currCapacity);
+	}
 
 	/*
-	 * Avoid duplicate FIFO entries for the same task.
+	 * Already the active task for this server.
+	 */
+	if (server->curr == p) {
+		p->edf_cbs.absDL = server->absDL;
+
+		if (RB_EMPTY_NODE(&p->edf_cbs.node))
+			insert_edf_tree(rq, p);
+
+		update_edf_pick(rq);
+
+		printk(KERN_INFO
+		       "soft enqueue active curr task=%u pid=%d server=%u absDL=%llu cap=%llu\n",
+		       p->edf_cbs.id,
+		       p->pid,
+		       p->edf_cbs.cbs_server_id,
+		       p->edf_cbs.absDL,
+		       server->currCapacity);
+
+		return;
+	}
+
+	/*
+	 * Avoid duplicate FIFO entries.
 	 */
 	list_for_each_entry(iter, &server->queue_head, node) {
 		if (iter->task == p)
@@ -81,33 +84,52 @@ static void enqueue_soft_rt_task(struct rq *rq, struct task_struct *p)
 
 	was_empty = list_empty(&server->queue_head) && server->curr == NULL;
 
+	/*
+	 * If this server is idle and has capacity, promote directly.
+	 * Do not put the task in the FIFO first.
+	 */
+	if (was_empty && server->currCapacity > 0) {
+		server->curr = p;
+		p->edf_cbs.absDL = server->absDL;
+
+		if (RB_EMPTY_NODE(&p->edf_cbs.node))
+			insert_edf_tree(rq, p);
+
+		update_edf_pick(rq);
+
+		printk(KERN_INFO
+		       "soft enqueue promoted task=%u pid=%d server=%u absDL=%llu cap=%llu\n",
+		       p->edf_cbs.id,
+		       p->pid,
+		       p->edf_cbs.cbs_server_id,
+		       p->edf_cbs.absDL,
+		       server->currCapacity);
+
+		return;
+	}
+
+	/*
+	 * Otherwise wait behind the current CBS task or wait for capacity.
+	 */
 	member = kmalloc(sizeof(*member), GFP_ATOMIC);
 	if (!member)
 		return;
 
 	member->task = p;
 	INIT_LIST_HEAD(&member->node);
-
 	list_add_tail(&member->node, &server->queue_head);
 
-	if (was_empty) {
-		struct cbs_queue *first;
-		struct task_struct *next;
+	printk(KERN_INFO
+		"soft enqueue fifo task=%u pid=%d server=%u curr=%u absDL=%llu cap=%llu node_empty=%d\n",
+		p->edf_cbs.id,
+		p->pid,
+		p->edf_cbs.cbs_server_id,
+		server->curr ? server->curr->edf_cbs.id : 0,
+		server->absDL,
+		server->currCapacity,
+		RB_EMPTY_NODE(&p->edf_cbs.node) ? 1 : 0);
 
-		first = list_first_entry(&server->queue_head,
-					 struct cbs_queue,
-					 node);
-		next = first->task;
-
-		list_del(&first->node);
-		kfree(first);
-
-		server->curr = next;
-		next->edf_cbs.absDL = server->absDL;
-
-		__insert_edf_tree(rq, next);
-		__update_edf_pick(rq);
-	}
+	update_edf_pick(rq);
 }
 
 static void enqueue_task_edf_cbs(struct rq *rq, struct task_struct *p, int flags)
@@ -128,6 +150,8 @@ static void enqueue_task_edf_cbs(struct rq *rq, struct task_struct *p, int flags
 
 static bool dequeue_task_edf_cbs(struct rq *rq, struct task_struct *p, int flags)
 {
+	bool deadline_update = flags & DEQUEUE_UPDATE_DEADLINE;
+
 	raw_spin_lock(&rq->edf_cbs.lock);
 
 	if (!p->edf_cbs.isHardRT) {
@@ -139,60 +163,173 @@ static bool dequeue_task_edf_cbs(struct rq *rq, struct task_struct *p, int flags
 					   p->edf_cbs.cbs_server_id);
 
 		if (server) {
-			/*
-			 * If p is currently active for this server, clear curr.
-			 */
-			if (server->curr == p) {
-				server->curr = NULL;
-				was_curr = true;
+			printk(KERN_INFO
+			       "soft dequeue enter task=%u pid=%d flags=%x deadline_update=%d server=%u curr=%u node_empty=%d fifo_empty=%d cap=%llu state=%u\n",
+			       p->edf_cbs.id,
+			       p->pid,
+			       flags,
+			       deadline_update ? 1 : 0,
+			       p->edf_cbs.cbs_server_id,
+			       server->curr ? server->curr->edf_cbs.id : 0,
+			       RB_EMPTY_NODE(&p->edf_cbs.node) ? 1 : 0,
+			       list_empty(&server->queue_head) ? 1 : 0,
+			       server->currCapacity,
+			       p->__state);
+
+			list_for_each_entry(entry, &server->queue_head, node) {
+				printk(KERN_INFO
+				       "soft fifo member server=%u member=%u pid=%d state=%u node_empty=%d\n",
+				       server->id,
+				       entry->task ? entry->task->edf_cbs.id : 0,
+				       entry->task ? entry->task->pid : -1,
+				       entry->task ? entry->task->__state : 0,
+				       entry->task ? (RB_EMPTY_NODE(&entry->task->edf_cbs.node) ? 1 : 0) : -1);
 			}
 
 			/*
-			 * Remove p from EDF tree if it is there.
-			 * This must happen even if server->curr != p,
-			 * because soft sleep paths may clear curr before
-			 * scheduler dequeue happens.
+			 * Always remove p from the EDF tree if present.
 			 */
 			if (!RB_EMPTY_NODE(&p->edf_cbs.node)) {
+				printk(KERN_INFO
+				       "soft dequeue erase tree task=%u pid=%d\n",
+				       p->edf_cbs.id,
+				       p->pid);
+
 				rb_erase(&p->edf_cbs.node,
 					 &rq->edf_cbs.tasks_tree);
 				RB_CLEAR_NODE(&p->edf_cbs.node);
 				sub_nr_running(rq, 1);
 			}
 
-			/*
-			 * Remove p from server FIFO if it is waiting there.
-			 */
-			list_for_each_entry_safe(entry, tmp,
-						 &server->queue_head, node) {
-				if (entry->task == p) {
-					list_del(&entry->node);
-					kfree(entry);
-					break;
+			if (!deadline_update) {
+				/*
+				 * Real dequeue/block/exit:
+				 * release CBS ownership and stop budget timer.
+				 */
+				if (server->curr == p) {
+					ktime_t end;
+					s64 elapsed;
+
+					/*
+					 * Real dequeue/block/exit of the active soft task:
+					 * stop budget timer and charge elapsed runtime.
+					 */
+					hrtimer_try_to_cancel(&server->capacityTimer);
+					server->capacity_active = false;
+
+					end = ktime_get();
+					elapsed = ktime_to_ns(ktime_sub(end, server->capacityTimerStart));
+
+					if (elapsed > 0) {
+						if ((u64)elapsed >= server->currCapacity)
+							server->currCapacity = 0;
+						else
+							server->currCapacity -= (u64)elapsed;
+					}
+
+					printk(KERN_INFO
+					       "soft dequeue release curr task=%u pid=%d elapsed=%lld remainingCap=%llu\n",
+					       p->edf_cbs.id,
+					       p->pid,
+					       elapsed,
+					       server->currCapacity);
+
+					server->curr = NULL;
+					was_curr = true;
+				} else {
+					printk(KERN_INFO
+					       "soft dequeue not curr task=%u pid=%d server_curr=%u\n",
+					       p->edf_cbs.id,
+					       p->pid,
+					       server->curr ? server->curr->edf_cbs.id : 0);
 				}
+
+				/*
+				 * Remove p from server FIFO if it was waiting.
+				 */
+				list_for_each_entry_safe(entry, tmp,
+							 &server->queue_head, node) {
+					if (entry->task == p) {
+						printk(KERN_INFO
+						       "soft dequeue remove waiting fifo task=%u pid=%d\n",
+						       p->edf_cbs.id,
+						       p->pid);
+
+						list_del(&entry->node);
+						kfree(entry);
+						break;
+					}
+				}
+
+				printk(KERN_INFO
+				       "soft dequeue promote check task=%u was_curr=%d curr=%u fifo_empty=%d cap=%llu\n",
+				       p->edf_cbs.id,
+				       was_curr ? 1 : 0,
+				       server->curr ? server->curr->edf_cbs.id : 0,
+				       list_empty(&server->queue_head) ? 1 : 0,
+				       server->currCapacity);
+
+				/*
+				 * Promote next waiting soft task only on real dequeue.
+				 */
+				if ((was_curr || server->curr == NULL) &&
+				    !list_empty(&server->queue_head)) {
+					struct cbs_queue *next_entry;
+					struct task_struct *next;
+
+					next_entry = list_first_entry(&server->queue_head,
+								      struct cbs_queue,
+								      node);
+					next = next_entry->task;
+
+					printk(KERN_INFO
+					       "soft dequeue promote selected from=%u to=%u pid=%d state=%u node_empty=%d absDL_old=%llu server_absDL=%llu cap=%llu\n",
+					       p->edf_cbs.id,
+					       next ? next->edf_cbs.id : 0,
+					       next ? next->pid : -1,
+					       next ? next->__state : 0,
+					       next ? (RB_EMPTY_NODE(&next->edf_cbs.node) ? 1 : 0) : -1,
+					       next ? next->edf_cbs.absDL : 0,
+					       server->absDL,
+					       server->currCapacity);
+
+					list_del(&next_entry->node);
+					kfree(next_entry);
+
+					server->curr = next;
+					next->edf_cbs.absDL = server->absDL;
+
+					insert_edf_tree(rq, next);
+
+					printk(KERN_INFO
+					       "soft dequeue promoted to=%u pid=%d node_empty_after=%d curr=%u\n",
+					       next->edf_cbs.id,
+					       next->pid,
+					       RB_EMPTY_NODE(&next->edf_cbs.node) ? 1 : 0,
+					       server->curr ? server->curr->edf_cbs.id : 0);
+				} else {
+					printk(KERN_INFO
+					       "soft dequeue no promote task=%u reason curr=%u fifo_empty=%d cap=%llu was_curr=%d\n",
+					       p->edf_cbs.id,
+					       server->curr ? server->curr->edf_cbs.id : 0,
+					       list_empty(&server->queue_head) ? 1 : 0,
+					       server->currCapacity,
+					       was_curr ? 1 : 0);
+				}
+			} else {
+				printk(KERN_INFO
+				       "soft dequeue skip real-release task=%u due deadline_update flags=%x\n",
+				       p->edf_cbs.id,
+				       flags);
 			}
-
-			/*
-			 * Promote next FIFO task if this dequeue freed the server.
-			 */
-			if ((was_curr || server->curr == NULL) &&
-			    !list_empty(&server->queue_head)) {
-				struct cbs_queue *next_entry;
-				struct task_struct *next;
-
-				next_entry = list_first_entry(&server->queue_head,
-							      struct cbs_queue,
-							      node);
-				next = next_entry->task;
-
-				list_del(&next_entry->node);
-				kfree(next_entry);
-
-				server->curr = next;
-				next->edf_cbs.absDL = server->absDL;
-
-				__insert_edf_tree(rq, next);
-			}
+		} else {
+			printk(KERN_INFO
+			       "soft dequeue no server task=%u pid=%d server_id=%u flags=%x deadline_update=%d\n",
+			       p->edf_cbs.id,
+			       p->pid,
+			       p->edf_cbs.cbs_server_id,
+			       flags,
+			       deadline_update ? 1 : 0);
 		}
 	} else {
 		if (!RB_EMPTY_NODE(&p->edf_cbs.node)) {
@@ -202,12 +339,20 @@ static bool dequeue_task_edf_cbs(struct rq *rq, struct task_struct *p, int flags
 		}
 	}
 
-	__update_edf_pick(rq);
+	update_edf_pick(rq);
+
+	printk(KERN_INFO
+	       "dequeue exit task=%u pid=%d pick=%u pick_pid=%d\n",
+	       p->edf_cbs.id,
+	       p->pid,
+	       rq->edf_cbs.task ? rq->edf_cbs.task->edf_cbs.id : 0,
+	       rq->edf_cbs.task ? rq->edf_cbs.task->pid : -1);
 
 	raw_spin_unlock(&rq->edf_cbs.lock);
 
 #ifdef CONFIG_MOKER_TRACING
-	moker_trace(DEQUEUE_RQ, p, -1);
+	moker_trace(DEQUEUE_RQ, p,
+		    deadline_update ? DEQUEUE_UPDATE_DEADLINE : -1);
 #endif
 
 	return true;
@@ -248,37 +393,86 @@ static int balance_edf_cbs(struct rq *rq, struct task_struct *prev, struct rq_fl
 	return 0;
 }
 
+static void activate_picked_soft_task_locked(struct rq *rq, struct task_struct *p)
+{
+	struct cbs_server *server;
+	u64 now_ns;
+	ktime_t expires;
+
+	if (!p || p->edf_cbs.isHardRT)
+		return;
+
+	server = lookup_cbs_server(&rq->edf_cbs, p->edf_cbs.cbs_server_id);
+	if (!server)
+		return;
+
+	/*
+	 * Only the current CBS owner may consume/arm CBS budget.
+	 */
+	if (server->curr != p)
+		return;
+
+	printk(KERN_INFO
+	       "pick_task activate soft task=%u pid=%d server=%p curr=%u cap=%llu armed=%d start=%llu absDL=%llu\n",
+	       p->edf_cbs.id,
+	       p->pid,
+	       server,
+	       server->curr ? server->curr->edf_cbs.id : 0,
+	       server->currCapacity,
+	       server->capacity_active ? 1 : 0,
+	       server->capacityTimerStart,
+	       server->absDL);
+
+	/*
+	 * pick_task() may be called repeatedly for the same task.
+	 * Arm only once per actual running slice.
+	 */
+	if (server->capacity_active)
+		return;
+
+	now_ns = ktime_get_ns();
+	server->capacityTimerStart = now_ns;
+
+	expires = ns_to_ktime(now_ns + server->currCapacity);
+
+	hrtimer_start(&server->capacityTimer,
+		      expires,
+		      HRTIMER_MODE_ABS);
+
+	server->capacity_active = true;
+
+	printk(KERN_INFO
+	       "[%llu ms] CBS capacity arm: server=%p task=%d mid=%u cap=%llu expires=%llu absDL=%llu\n",
+	       now_ns / 1000000ULL,
+	       server,
+	       p->pid,
+	       p->edf_cbs.id,
+	       server->currCapacity,
+	       now_ns + server->currCapacity,
+	       server->absDL);
+}
+
 static struct task_struct *pick_task_edf_cbs(struct rq *rq, struct rq_flags *rf)
 {
 	struct task_struct *task;
 
 	raw_spin_lock(&rq->edf_cbs.lock);
 
+	update_edf_pick(rq);
 	task = rq->edf_cbs.task;
 
-	if (task && task->edf_cbs.isHardRT == false) {
-		struct cbs_server *server;
+	if (task)
+		activate_picked_soft_task_locked(rq, task);
 
-		server = lookup_cbs_server(&rq->edf_cbs,
-					   task->edf_cbs.cbs_server_id);
-
-		if (server &&
-		    server->curr == task &&
-		    server->currCapacity > 0 &&
-		    !hrtimer_active(&server->capacityTimer)) {
-			ktime_t now;
-			ktime_t expires;
-
-			now = ktime_get();
-			server->capacityTimerStart = now;
-
-			expires = ktime_add_ns(now, server->currCapacity);
-
-			hrtimer_start(&server->capacityTimer,
-				      expires,
-				      HRTIMER_MODE_ABS);
-		}
-	}
+	printk(KERN_INFO
+	       "pick_task EDF task=%d mid=%u soft=%d currCap=%llu absDL=%llu\n",
+	       task ? task->pid : -1,
+	       task ? task->edf_cbs.id : 0,
+	       task ? !task->edf_cbs.isHardRT : 0,
+	       (!task || task->edf_cbs.isHardRT) ? 0 :
+		       lookup_cbs_server(&rq->edf_cbs,
+					 task->edf_cbs.cbs_server_id)->currCapacity,
+	       task ? task->edf_cbs.absDL : 0);
 
 	raw_spin_unlock(&rq->edf_cbs.lock);
 
@@ -290,6 +484,9 @@ static struct task_struct *pick_next_task_edf_cbs(struct rq *rq,
 						  struct rq_flags *rf)
 {
 	struct task_struct *task;
+	struct cbs_server *server = NULL;
+	u64 curr_cap = 0;
+	bool soft = false;
 
 	if (prev &&
 	    prev->policy == SCHED_EDF_CBS &&
@@ -299,7 +496,7 @@ static struct task_struct *pick_next_task_edf_cbs(struct rq *rq,
 		prev->edf_cbs.deadlineUpdate = false;
 		still_running = READ_ONCE(prev->__state) == TASK_RUNNING;
 
-		dequeue_task_edf_cbs(rq, prev, 0);
+		dequeue_task_edf_cbs(rq, prev, DEQUEUE_UPDATE_DEADLINE);
 
 		if (still_running)
 			enqueue_task_edf_cbs(rq, prev, 0);
@@ -307,8 +504,28 @@ static struct task_struct *pick_next_task_edf_cbs(struct rq *rq,
 
 	raw_spin_lock(&rq->edf_cbs.lock);
 
-	__update_edf_pick(rq);
+	update_edf_pick(rq);
 	task = rq->edf_cbs.task;
+
+	if (task && !task->edf_cbs.isHardRT) {
+		soft = true;
+		server = lookup_cbs_server(&rq->edf_cbs,
+					   task->edf_cbs.cbs_server_id);
+
+		if (server)
+			curr_cap = server->currCapacity;
+	}
+
+	if (task)
+		activate_picked_soft_task_locked(rq, task);
+
+	printk(KERN_INFO
+	       "pick_next EDF task=%d mid=%u soft=%d currCap=%llu absDL=%llu\n",
+	       task ? task->pid : -1,
+	       task ? task->edf_cbs.id : 0,
+	       soft ? 1 : 0,
+	       curr_cap,
+	       task ? task->edf_cbs.absDL : 0);
 
 	raw_spin_unlock(&rq->edf_cbs.lock);
 
@@ -319,6 +536,7 @@ static void put_prev_task_edf_cbs(struct rq *rq,
 				  struct task_struct *p,
 				  struct task_struct *next)
 {
+	
 }
 
 static void set_next_task_edf_cbs(struct rq *rq,

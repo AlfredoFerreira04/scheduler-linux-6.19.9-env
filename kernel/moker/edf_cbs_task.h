@@ -11,6 +11,7 @@ struct sched_edf_cbs_entity {
 	u64 startInstant;   	/* first release time (absolute) */
 	u64 relDL;          	/* relative deadline / period */
 	u64 absDL;          	/* absolute deadline */
+	u64 absT;
 
 	bool deadlineUpdate;	/* flag to update DL on enqueue */
 

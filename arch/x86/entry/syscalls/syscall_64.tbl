@@ -405,7 +405,7 @@
 473 common delay_edf_cbs_task_until_next_T sys_delay_edf_cbs_task_until_next_T
 474 common create_moker_cbs_server sys_create_moker_cbs_server
 475 common setup_moker_edf_cbs_soft_task sys_setup_moker_edf_cbs_soft_task
-
+476 common destroy_moker_cbs_server sys_destroy_moker_cbs_server
 #endif
 
 #

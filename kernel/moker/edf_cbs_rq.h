@@ -23,10 +23,13 @@ struct cbs_server {
 	struct list_head list_node; // Link to the list in edf_cbs_rq
 	u64 relDL;          	/* relative deadline / period */
 	u64 absDL;          	/* absolute deadline */
+
+	struct rq *rq;
 	
 	u64 maximumCapacity;
 	u64 currCapacity;
 	u64 capacityTimerStart;
+	bool capacity_active;
 	
 	struct hrtimer capacityTimer;
 	struct hrtimer deadlineTimer;
@@ -43,7 +46,7 @@ struct edf_cbs_rq {
 
 /* Function Prototypes */
 void init_edf_cbs_rq(struct edf_cbs_rq *rq);
-struct cbs_server *create_cbs_server(struct edf_cbs_rq *rq, int id_unused, u64 relDL, u64 capacity);
+struct cbs_server *create_cbs_server(struct edf_cbs_rq *rq, u32 id_unused, u64 relDL, u64 capacity);
 void destroy_cbs_server(struct rq *rq, int id, bool transfer_flag);
 struct cbs_server *lookup_cbs_server(struct edf_cbs_rq *rq, int id);
 

@@ -7,6 +7,7 @@
 #include "../sched/sched.h"
 #include "trace.h"
 #include "edf_cbs.h"
+#include "utils.h"
 
 SYSCALL_DEFINE1(moker_tracing, unsigned int, enable)
 {
@@ -50,10 +51,13 @@ int do_setup_moker_edf_cbs_task(u32 id,u64 startInstant, u64 deadline)
 	return 1;
 }
 
-SYSCALL_DEFINE0(delay_edf_cbs_task_until_next_T){
-	printk(KERN_INFO "Delay current edf_cbs task of id [%u] until it's next period]", current->edf_cbs.id);
-	do_delay_edf_cbs_task_until_next_T();
-	return 1;
+SYSCALL_DEFINE0(delay_edf_cbs_task_until_next_T)
+{
+	printk(KERN_INFO
+	       "Delay current edf_cbs task of id [%u] until its next period\n",
+	       current->edf_cbs.id);
+
+	return do_delay_edf_cbs_task_until_next_T();
 }
 
 int do_delay_edf_cbs_task_until_next_T(void)
@@ -100,35 +104,64 @@ int do_delay_edf_cbs_task_until_next_T(void)
 			struct cbs_server *server;
 
 			/*
-			 * Soft RT:
-			 * Account consumed CBS capacity, but do not modify
-			 * server FIFO placement here. The scheduler dequeue
-			 * and enqueue paths should handle that.
-			 */
+			* Soft RT:
+			* Account consumed CBS capacity and release CBS ownership before
+			* voluntarily sleeping until the next period.
+			* FIFO promotion remains handled by scheduler enqueue/dequeue paths.
+			*/
 			rq = task_rq_lock(current, &rf);
 
 			server = lookup_cbs_server(&rq->edf_cbs,
 						   current->edf_cbs.cbs_server_id);
 
 			if (server && server->curr == current) {
-				ktime_t end;
-				s64 elapsed;
+				account_cbs_runtime(server);
+				printk(KERN_INFO
+					"soft delay after account server=%u from=%u cap=%llu active=%d start=%llu curr=%u\n",
+					server->id,
+					current->edf_cbs.id,
+					server->currCapacity,
+					server->capacity_active ? 1 : 0,
+					server->capacityTimerStart,
+					server->curr ? server->curr->edf_cbs.id : 0);
 
-				hrtimer_cancel(&server->capacityTimer);
-
-				end = ktime_get();
-				elapsed = ktime_to_ns(
-					ktime_sub(end, server->capacityTimerStart)
-				);
-
-				if (elapsed > 0) {
-					if ((u64)elapsed >= server->currCapacity)
-						server->currCapacity = 0;
-					else
-						server->currCapacity -= (u64)elapsed;
+				if (!RB_EMPTY_NODE(&current->edf_cbs.node)) {
+					rb_erase(&current->edf_cbs.node, &rq->edf_cbs.tasks_tree);
+					RB_CLEAR_NODE(&current->edf_cbs.node);
+					sub_nr_running(rq, 1);
 				}
-			}
 
+				server->curr = NULL;
+
+				if (!list_empty(&server->queue_head)) {
+					struct cbs_queue *next_entry;
+					struct task_struct *next;
+
+					next_entry = list_first_entry(&server->queue_head,
+									struct cbs_queue,
+									node);
+					next = next_entry->task;
+
+					list_del(&next_entry->node);
+					kfree(next_entry);
+
+					server->curr = next;
+					next->edf_cbs.absDL = server->absDL;
+					next->edf_cbs.deadlineUpdate = false;
+
+					insert_edf_tree(rq, next);
+				}
+
+				update_edf_pick(rq);
+
+				printk(KERN_INFO
+					"soft delay release/promote server=%u from=%u curr=%u remainingCap=%llu\n",
+					current->edf_cbs.cbs_server_id,
+					current->edf_cbs.id,
+					server->curr ? server->curr->edf_cbs.id : 0,
+					server->currCapacity);
+			}
+			
 			current->edf_cbs.deadlineUpdate = true;
 
 			task_rq_unlock(rq, current, &rf);
@@ -138,11 +171,11 @@ int do_delay_edf_cbs_task_until_next_T(void)
 			 * It keeps its own period bookkeeping, while CBS
 			 * scheduling priority remains server-deadline based.
 			 */
-			refresh_task_deadline(current);
+			expires = ns_to_ktime(current->edf_cbs.absT);
 
-			expires = ns_to_ktime(current->edf_cbs.absDL);
+			refresh_task_period(current);
+
 			now = ktime_get();
-
 			if (ktime_compare(expires, now) <= 0) {
 				set_tsk_need_resched(current);
 				return 1;
@@ -152,19 +185,24 @@ int do_delay_edf_cbs_task_until_next_T(void)
 			schedule_hrtimeout(&expires, HRTIMER_MODE_ABS);
 			__set_current_state(TASK_RUNNING);
 
-			{
-				u64 now_ns = ktime_get_ns();
-				s64 delta = (s64)(current->edf_cbs.absDL - now_ns);
+		{
 
-				printk(KERN_INFO
-				       "delay soft id=%u server=%u now=%llu absDL=%llu delta=%lld state=%u\n",
-				       current->edf_cbs.id,
-				       current->edf_cbs.cbs_server_id,
-				       now_ns,
-				       current->edf_cbs.absDL,
-				       delta,
-				       current->__state);
-			}
+			/* Tracing */
+			u64 now_ns = ktime_get_ns();
+			s64 deltaT = (s64)(current->edf_cbs.absT - now_ns);
+			s64 deltaDL = (s64)(current->edf_cbs.absDL - now_ns);
+
+			printk(KERN_INFO
+				"delay soft id=%u server=%u now=%llu absT=%llu absDL=%llu deltaT=%lld deltaDL=%lld state=%u\n",
+				current->edf_cbs.id,
+				current->edf_cbs.cbs_server_id,
+				now_ns,
+				current->edf_cbs.absT,
+				current->edf_cbs.absDL,
+				deltaT,
+				deltaDL,
+				current->__state);
+		}
 
 			return 0;
 		}
@@ -176,11 +214,6 @@ int do_delay_edf_cbs_task_until_next_T(void)
 
 SYSCALL_DEFINE2(create_moker_cbs_server, u64, relDL, u64, capacity)
 {
-	printk(KERN_INFO "MOKER [%d] | create CBS server relDL -> [%llu], capacity -> [%llu]\n",
-	       current->pid,
-	       (unsigned long long)relDL,
-	       (unsigned long long)capacity);
-
 	return do_create_moker_cbs_server(relDL, capacity);
 }
 
@@ -209,8 +242,9 @@ long do_create_moker_cbs_server(u64 relDL, u64 capacity)
 	return -ENOSYS;
 }
 
-SYSCALL_DEFINE3(setup_moker_edf_cbs_soft_task,
+SYSCALL_DEFINE4(setup_moker_edf_cbs_soft_task,
 		u32, server_id,
+		u32, task_id,
 		u64, startInstant,
 		u64, relDL)
 {
@@ -220,10 +254,10 @@ SYSCALL_DEFINE3(setup_moker_edf_cbs_soft_task,
 	       (unsigned long long)startInstant,
 	       (unsigned long long)relDL);
 
-	return do_setup_moker_edf_cbs_soft_task(server_id, startInstant, relDL);
+	return do_setup_moker_edf_cbs_soft_task(server_id, task_id, startInstant, relDL);
 }
 
-int do_setup_moker_edf_cbs_soft_task(u32 server_id, u64 startInstant, u64 relDL)
+int do_setup_moker_edf_cbs_soft_task(u32 server_id, u32 task_id, u64 startInstant, u64 relDL)
 {
 #ifdef CONFIG_MOKER_EDF_CBS_POLICY
 	struct sched_edf_cbs_entity *sched_entity = &current->edf_cbs;
@@ -241,21 +275,92 @@ int do_setup_moker_edf_cbs_soft_task(u32 server_id, u64 startInstant, u64 relDL)
 		return -EINVAL;
 	}
 
-	if (server->absDL == 0)
-		server->absDL = startInstant + server->relDL;
-
 	server_absDL = server->absDL;
 
 	task_rq_unlock(rq, current, &rf);
 
 	sched_entity->startInstant = startInstant;
+	sched_entity->absT = startInstant + relDL;
 	sched_entity->relDL = relDL;              /* task period/timekeeping */
 	sched_entity->absDL = server_absDL;       /* CBS scheduling deadline */
 	sched_entity->deadlineUpdate = false;
 	sched_entity->cbs_server_id = server_id;
+	sched_entity->id = task_id;
 	sched_entity->isHardRT = false;
 
 	return sched_setscheduler(current, SCHED_EDF_CBS, &param);
 #endif
 	return -ENOSYS;
+}
+
+SYSCALL_DEFINE1(destroy_moker_cbs_server, u32, server_id)
+{
+	printk(KERN_INFO "MOKER [%d] | destroy CBS server id -> [%u]\n",
+	       current->pid,
+	       server_id);
+
+	return do_destroy_moker_cbs_server(server_id);
+}
+
+int do_destroy_moker_cbs_server(u32 server_id)
+{
+	struct cbs_server *server;
+	struct cbs_queue *entry, *tmp;
+	struct rq *rq;
+
+	rq = cpu_rq(task_cpu(current));
+
+	raw_spin_lock(&rq->edf_cbs.lock);
+
+	server = lookup_cbs_server(&rq->edf_cbs, server_id);
+	if (!server) {
+		raw_spin_unlock(&rq->edf_cbs.lock);
+		return -ENOENT;
+	}
+
+	/*
+	 * Stop timers before freeing the server.
+	 *
+	 * hrtimer_cancel() waits for an active callback to finish, so the
+	 * server won't be freed while its timer function is still running.
+	 */
+	hrtimer_cancel(&server->capacityTimer);
+	hrtimer_cancel(&server->deadlineTimer);
+
+	/*
+	 * If the current server task is still in the EDF tree, remove it.
+	 */
+	if (server->curr) {
+		struct task_struct *p = server->curr;
+
+		if (!RB_EMPTY_NODE(&p->edf_cbs.node)) {
+			rb_erase(&p->edf_cbs.node, &rq->edf_cbs.tasks_tree);
+			RB_CLEAR_NODE(&p->edf_cbs.node);
+			sub_nr_running(rq, 1);
+		}
+
+		p->edf_cbs.cbs_server_id = -1;
+		server->curr = NULL;
+	}
+
+	/*
+	 * Free waiting soft tasks from the CBS FIFO.
+	 */
+	list_for_each_entry_safe(entry, tmp, &server->queue_head, node) {
+		if (entry->task)
+			entry->task->edf_cbs.cbs_server_id = -1;
+
+		list_del(&entry->node);
+		kfree(entry);
+	}
+
+	list_del(&server->list_node);
+
+	raw_spin_unlock(&rq->edf_cbs.lock);
+
+	kfree(server);
+
+	printk(KERN_INFO "MOKER: destroyed CBS server id=%u\n", server_id);
+
+	return 0;
 }

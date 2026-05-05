@@ -75,6 +75,7 @@ static int dequeue(char *buffer)
 	len += sprintf(buffer + len, "%d,", (int)e.policy);
 	len += sprintf(buffer + len, "%d,", (int)e.prio);
 	len += sprintf(buffer + len, "%d,", (int)e.pid);
+	len += sprintf(buffer + len, "%u,", e.moker_id);
 	len += sprintf(buffer + len, "%d,", (int)e.state);
 	len += sprintf(buffer + len, "%s\n", e.comm);
 
@@ -91,7 +92,8 @@ static int enqueue(enum evt event, unsigned long long time, int number, struct t
     trace.events[trace.write_item].number = number;
     trace.events[trace.write_item].event = event;
     trace.events[trace.write_item].time = time;
-    trace.events[trace.write_item].pid = p->pid;
+	trace.events[trace.write_item].pid = p->pid;
+	trace.events[trace.write_item].moker_id = p->edf_cbs.id;
     trace.events[trace.write_item].state = p->__state;
     trace.events[trace.write_item].prio = p->prio;
     trace.events[trace.write_item].policy = p->policy;

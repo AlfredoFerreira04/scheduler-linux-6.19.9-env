@@ -16,14 +16,15 @@ enum evt {
 };
 
 struct trace_evt {
-    enum evt event;
-    unsigned long long time;
-    int number;
-    pid_t pid;
-    int state;
-    int prio;
-    int policy;
-    char comm[TRACE_TASK_COMM_LEN];
+	unsigned long long time;
+	enum evt event;
+	int number;
+	int policy;
+	int prio;
+	int pid;
+	unsigned int moker_id;
+	unsigned int state;
+	char comm[TASK_COMM_LEN];
 };
 
 struct trace_evt_buffer {
