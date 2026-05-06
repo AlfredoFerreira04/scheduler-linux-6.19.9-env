@@ -38,6 +38,7 @@ int do_setup_moker_edf_cbs_task(u32 id,u64 startInstant, u64 deadline)
 #ifdef CONFIG_MOKER_EDF_CBS_POLICY
 	struct sched_edf_cbs_entity *sched_entity = &current->edf_cbs;
 
+	RB_CLEAR_NODE(&sched_entity->node);
 	sched_entity->absDL = startInstant + deadline;
 	sched_entity->startInstant = startInstant;
 	sched_entity->relDL = deadline;
@@ -68,11 +69,10 @@ int do_delay_edf_cbs_task_until_next_T(void)
 		ktime_t now;
 
 		if (current->edf_cbs.isHardRT) {
-			expires = ns_to_ktime(current->edf_cbs.absDL);
+			ktime_t now = ktime_get();
+			ktime_t expires = ns_to_ktime(current->edf_cbs.absDL);
 
 			refresh_task_deadline(current);
-
-			now = ktime_get();
 
 			if (ktime_compare(expires, now) <= 0) {
 				current->edf_cbs.deadlineUpdate = true;
@@ -84,24 +84,12 @@ int do_delay_edf_cbs_task_until_next_T(void)
 			schedule_hrtimeout(&expires, HRTIMER_MODE_ABS);
 			__set_current_state(TASK_RUNNING);
 
-			{
-				u64 now_ns = ktime_get_ns();
-				s64 delta = (s64)(current->edf_cbs.absDL - now_ns);
-
-				printk(KERN_INFO
-				       "delay hard id=%u now=%llu absDL=%llu delta=%lld state=%u\n",
-				       current->edf_cbs.id,
-				       now_ns,
-				       current->edf_cbs.absDL,
-				       delta,
-				       current->__state);
-			}
-
 			return 0;
 		} else {
 			struct rq *rq;
 			struct rq_flags rf;
 			struct cbs_server *server;
+			u64 now_before_account;
 
 			/*
 			* Soft RT:
@@ -109,6 +97,7 @@ int do_delay_edf_cbs_task_until_next_T(void)
 			* voluntarily sleeping until the next period.
 			* FIFO promotion remains handled by scheduler enqueue/dequeue paths.
 			*/
+			now_before_account = ktime_get_ns();
 			rq = task_rq_lock(current, &rf);
 
 			server = lookup_cbs_server(&rq->edf_cbs,
@@ -117,13 +106,15 @@ int do_delay_edf_cbs_task_until_next_T(void)
 			if (server && server->curr == current) {
 				account_cbs_runtime(server);
 				printk(KERN_INFO
-					"soft delay after account server=%u from=%u cap=%llu active=%d start=%llu curr=%u\n",
+					"soft delay after account server=%u from=%u cap=%llu active=%d start=%llu curr=%u consumed_span=%llu now_ms=%llu\n",
 					server->id,
 					current->edf_cbs.id,
 					server->currCapacity,
 					server->capacity_active ? 1 : 0,
 					server->capacityTimerStart,
-					server->curr ? server->curr->edf_cbs.id : 0);
+					server->curr ? server->curr->edf_cbs.id : 0,
+					now_before_account - server->capacityTimerStart,
+					now_before_account / 1000000ULL);
 
 				if (!RB_EMPTY_NODE(&current->edf_cbs.node)) {
 					rb_erase(&current->edf_cbs.node, &rq->edf_cbs.tasks_tree);
@@ -171,19 +162,42 @@ int do_delay_edf_cbs_task_until_next_T(void)
 			 * It keeps its own period bookkeeping, while CBS
 			 * scheduling priority remains server-deadline based.
 			 */
-			expires = ns_to_ktime(current->edf_cbs.absT);
-
 			refresh_task_period(current);
+
+			expires = ns_to_ktime(current->edf_cbs.absT);
+			printk(KERN_INFO
+				"soft delay post-refresh id=%u absT=%llu now=%llu delta_ms=%lld\n",
+				current->edf_cbs.id,
+				current->edf_cbs.absT,
+				ktime_get_ns(),
+				(s64)(current->edf_cbs.absT - ktime_get_ns()) / 1000000);
 
 			now = ktime_get();
 			if (ktime_compare(expires, now) <= 0) {
+				printk(KERN_INFO
+					"soft delay past deadline id=%u absT=%llu now=%llu, rescheduling\n",
+					current->edf_cbs.id,
+					current->edf_cbs.absT,
+					ktime_to_ns(now));
 				set_tsk_need_resched(current);
 				return 1;
 			}
 
+			printk(KERN_INFO
+				"soft delay sleep id=%u sleep_until=%llu now=%llu delta_ms=%lld\n",
+				current->edf_cbs.id,
+				current->edf_cbs.absT,
+				ktime_to_ns(now),
+				(s64)(current->edf_cbs.absT - ktime_to_ns(now)) / 1000000);
+
 			set_current_state(TASK_INTERRUPTIBLE);
 			schedule_hrtimeout(&expires, HRTIMER_MODE_ABS);
 			__set_current_state(TASK_RUNNING);
+			printk(KERN_INFO
+				"soft delay woken id=%u now=%llu state=%u\n",
+				current->edf_cbs.id,
+				ktime_get_ns() / 1000000ULL,
+				READ_ONCE(current->__state));
 
 		{
 
@@ -193,7 +207,7 @@ int do_delay_edf_cbs_task_until_next_T(void)
 			s64 deltaDL = (s64)(current->edf_cbs.absDL - now_ns);
 
 			printk(KERN_INFO
-				"delay soft id=%u server=%u now=%llu absT=%llu absDL=%llu deltaT=%lld deltaDL=%lld state=%u\n",
+				"soft delay return id=%u server=%u now=%llu absT=%llu absDL=%llu deltaT=%lld deltaDL=%lld state=%u\n",
 				current->edf_cbs.id,
 				current->edf_cbs.cbs_server_id,
 				now_ns,
@@ -201,7 +215,7 @@ int do_delay_edf_cbs_task_until_next_T(void)
 				current->edf_cbs.absDL,
 				deltaT,
 				deltaDL,
-				current->__state);
+				READ_ONCE(current->__state));
 		}
 
 			return 0;
@@ -212,12 +226,12 @@ int do_delay_edf_cbs_task_until_next_T(void)
 }
 
 
-SYSCALL_DEFINE2(create_moker_cbs_server, u64, relDL, u64, capacity)
+SYSCALL_DEFINE3(create_moker_cbs_server, u64, relDL, u64, capacity, u64, start_instant)
 {
-	return do_create_moker_cbs_server(relDL, capacity);
+	return do_create_moker_cbs_server(relDL, capacity, start_instant);
 }
 
-long do_create_moker_cbs_server(u64 relDL, u64 capacity)
+long do_create_moker_cbs_server(u64 relDL, u64 capacity, u64 start_instant)
 {
 #ifdef CONFIG_MOKER_EDF_CBS_POLICY
 	struct rq *rq;
@@ -227,7 +241,7 @@ long do_create_moker_cbs_server(u64 relDL, u64 capacity)
 
 	rq = task_rq_lock(current, &rf);
 
-	server = create_cbs_server(&rq->edf_cbs, -1, relDL, capacity);
+	server = create_cbs_server(&rq->edf_cbs, start_instant, relDL, capacity);
 	if (!server) {
 		task_rq_unlock(rq, current, &rf);
 		return -ENOMEM;
@@ -248,8 +262,9 @@ SYSCALL_DEFINE4(setup_moker_edf_cbs_soft_task,
 		u64, startInstant,
 		u64, relDL)
 {
-	printk(KERN_INFO "MOKER [%d] | soft_server_id -> [%u], startInstant -> [%llu], relDL -> [%llu]\n",
+	printk("MOKER [%d] | task=%u, soft_server_id -> [%u], startInstant -> [%llu], relDL -> [%llu]\n",
 	       current->pid,
+		   	task_id,
 	       server_id,
 	       (unsigned long long)startInstant,
 	       (unsigned long long)relDL);
@@ -279,6 +294,7 @@ int do_setup_moker_edf_cbs_soft_task(u32 server_id, u32 task_id, u64 startInstan
 
 	task_rq_unlock(rq, current, &rf);
 
+	RB_CLEAR_NODE(&sched_entity->node);
 	sched_entity->startInstant = startInstant;
 	sched_entity->absT = startInstant + relDL;
 	sched_entity->relDL = relDL;              /* task period/timekeeping */

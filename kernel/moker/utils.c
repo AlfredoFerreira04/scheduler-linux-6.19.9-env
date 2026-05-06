@@ -42,30 +42,37 @@ void account_cbs_runtime(struct cbs_server *server)
 
 void insert_edf_tree(struct rq *rq, struct task_struct *p)
 {
-	struct rb_root *root = &rq->edf_cbs.tasks_tree;
-	struct rb_node **link = &root->rb_node;
-	struct rb_node *parent = NULL;
-	struct sched_edf_cbs_entity *se = &p->edf_cbs;
+    struct rb_root *root = &rq->edf_cbs.tasks_tree;
+    struct rb_node **link = &root->rb_node;
+    struct rb_node *parent = NULL;
+    struct sched_edf_cbs_entity *se = &p->edf_cbs;
 
-	if (!RB_EMPTY_NODE(&se->node))
+    /* Skip if already in tree (already enqueued) */
+    if (!RB_EMPTY_NODE(&se->node))
 		return;
+    
+    /* Initialize the rbtree node for first insertion */
+    RB_CLEAR_NODE(&se->node);
 
-	while (*link) {
-		struct sched_edf_cbs_entity *entry;
+    /* Standard BST search to find insertion point */
+    while (*link) {
+        struct sched_edf_cbs_entity *entry;
 
-		entry = rb_entry(*link, struct sched_edf_cbs_entity, node);
-		parent = *link;
+        entry = rb_entry(*link, struct sched_edf_cbs_entity, node);
+        parent = *link;
 
-		if (se->absDL < entry->absDL)
-			link = &(*link)->rb_left;
-		else
-			link = &(*link)->rb_right;
-	}
+        if (se->absDL < entry->absDL)
+            link = &(*link)->rb_left;
+        else
+            link = &(*link)->rb_right;
+    }
 
-	rb_link_node(&se->node, parent, link);
-	rb_insert_color(&se->node, root);
+    /* Link the new node and rebalance the red-black tree */
+    rb_link_node(&se->node, parent, link);
+    rb_insert_color(&se->node, root);
 
-	add_nr_running(rq, 1);
+    /* Update runqueue count */
+    add_nr_running(rq, 1);
 }
 
 void update_edf_pick(struct rq *rq)

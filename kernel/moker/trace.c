@@ -2,6 +2,7 @@
 #include <linux/kernel.h>
 #include <linux/proc_fs.h>
 #include <linux/sched.h>
+#include <linux/string.h>
 #include <asm/uaccess.h>
 #include <linux/uaccess.h>
 #include "trace.h"
@@ -83,6 +84,9 @@ static int dequeue(char *buffer)
 }
 
 static int enqueue(enum evt event, unsigned long long time, int number, struct task_struct *p) {
+	if (!p)
+		return 0;
+
     spin_lock(&trace.lock);
 
     if (is_full(trace.read_item, trace.write_item)) {
@@ -98,7 +102,9 @@ static int enqueue(enum evt event, unsigned long long time, int number, struct t
     trace.events[trace.write_item].prio = p->prio;
     trace.events[trace.write_item].policy = p->policy;
 
-    strcpy(trace.events[trace.write_item].comm, p->comm);
+	strscpy(trace.events[trace.write_item].comm,
+			p->comm,
+			sizeof(trace.events[trace.write_item].comm));
 
     increment(&trace.write_item);
 
@@ -150,7 +156,7 @@ module_init(proc_trace_init);
 void moker_trace(enum evt event, struct task_struct *p, int number)
 {
 	unsigned long long time;
-	if(enabled){
+	if (enabled && p) {
 		time = ktime_to_ns(ktime_get());
 		enqueue(event,time, number, p);
 	}

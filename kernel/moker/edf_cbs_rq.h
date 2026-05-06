@@ -46,7 +46,7 @@ struct edf_cbs_rq {
 
 /* Function Prototypes */
 void init_edf_cbs_rq(struct edf_cbs_rq *rq);
-struct cbs_server *create_cbs_server(struct edf_cbs_rq *rq, u32 id_unused, u64 relDL, u64 capacity);
+struct cbs_server *create_cbs_server(struct edf_cbs_rq *rq, u64 start_instant, u64 relDL, u64 capacity);
 void destroy_cbs_server(struct rq *rq, int id, bool transfer_flag);
 struct cbs_server *lookup_cbs_server(struct edf_cbs_rq *rq, int id);
 

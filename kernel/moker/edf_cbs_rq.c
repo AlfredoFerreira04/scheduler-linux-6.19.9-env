@@ -1,6 +1,7 @@
 #include "../sched/sched.h"
 #include "linux/container_of.h"
 #include "linux/ktime.h"
+#include <linux/bug.h>
 #include "edf_cbs_rq.h"
 #include "utils.h"
 
@@ -70,13 +71,28 @@ static enum hrtimer_restart cbs_capacity_timer_fn(struct hrtimer *timer)
 	 * - replenish capacity
 	 * - push server deadline
 	 * - update current soft task deadline
+	 *
+	 * If the task is currently in the EDF tree, remove-and-reinsert
+	 * under the rq/edf_cbs lock to update its sort key atomically and
+	 * keep runqueue accounting consistent.
 	 */
 	server->currCapacity = server->maximumCapacity;
 	server->absDL += server->relDL;
 	server->capacity_active = false;
 
+	if (!RB_EMPTY_NODE(&p->edf_cbs.node)) {
+		//WARN_ON_ONCE(p->edf_cbs.absDL != server->absDL);
+		rb_erase(&p->edf_cbs.node, &rq->edf_cbs.tasks_tree);
+		RB_CLEAR_NODE(&p->edf_cbs.node);
+		sub_nr_running(rq, 1);
+	}
+
 	p->edf_cbs.absDL = server->absDL;
 	p->edf_cbs.deadlineUpdate = true;
+
+	/* re-insert with updated deadline */
+	insert_edf_tree(rq, p);
+	update_edf_pick(rq);
 
 	printk(KERN_WARNING
 		"MOKER_CBS_CAPACITY_EXHAUSTED now_ms=%llu "
@@ -104,53 +120,72 @@ static enum hrtimer_restart cbs_deadline_timer_fn(struct hrtimer *timer)
 	struct cbs_server *server;
 	struct task_struct *p;
 	struct rq *rq;
+	struct rq_flags rf;
 
 	server = container_of(timer, struct cbs_server, deadlineTimer);
 	rq = server->rq;
 
-	raw_spin_lock(&rq->edf_cbs.lock);
+	/* If there is a current task, take its rq lock so we can safely
+	 * update runqueue accounting when changing the deadline key.
+	 */
+	p = server->curr;
 
 	server->currCapacity = server->maximumCapacity;
 	server->absDL += server->relDL;
 
-	p = server->curr;
+	if (!p) {
+		/* No current task: nothing to reorder on the tree. */
+		printk(KERN_INFO
+			   "[%llu ms] CBS deadline recharge (no curr): server=%u cap=%llu absDL=%llu\n",
+			   ktime_get_ns() / 1000000ULL,
+			   server->id,
+			   server->currCapacity,
+			   server->absDL);
 
-	if (p) {
-		bool was_in_tree = !RB_EMPTY_NODE(&p->edf_cbs.node);
+		hrtimer_forward_now(&server->deadlineTimer, ns_to_ktime(server->relDL));
+		return HRTIMER_RESTART;
+	}
 
-		if (was_in_tree) {
+	rq = task_rq_lock(p, &rf);
+	raw_spin_lock(&rq->edf_cbs.lock);
+
+	/* Re-check current under locks */
+	if (server->curr == p) {
+		if (!RB_EMPTY_NODE(&p->edf_cbs.node)) {
+			//WARN_ON_ONCE(p->edf_cbs.absDL != server->absDL);
 			rb_erase(&p->edf_cbs.node, &rq->edf_cbs.tasks_tree);
 			RB_CLEAR_NODE(&p->edf_cbs.node);
 			sub_nr_running(rq, 1);
 		}
 
 		p->edf_cbs.absDL = server->absDL;
+		p->edf_cbs.deadlineUpdate = true;
 
-		if (was_in_tree)
-			insert_edf_tree(rq, p);
+		/* re-insert with the updated deadline */
+		insert_edf_tree(rq, p);
+		update_edf_pick(rq);
 
 		set_tsk_need_resched(p);
 	}
 
-	update_edf_pick(rq);
+	printk(KERN_INFO
+		   "[%llu ms] CBS deadline recharge: server=%u cap=%llu absDL=%llu curr=%d mid=%u\n",
+		   ktime_get_ns() / 1000000ULL,
+		   server->id,
+		   server->currCapacity,
+		   server->absDL,
+		   p ? p->pid : -1,
+		   p ? p->edf_cbs.id : 0);
 
 	raw_spin_unlock(&rq->edf_cbs.lock);
-
-	printk(KERN_INFO
-	       "[%llu ms] CBS deadline recharge: server=%p cap=%llu absDL=%llu curr=%d mid=%u\n",
-	       ktime_get_ns() / 1000000ULL,
-	       server,
-	       server->currCapacity,
-	       server->absDL,
-	       p ? p->pid : -1,
-	       p ? p->edf_cbs.id : 0);
+	task_rq_unlock(rq, p, &rf);
 
 	hrtimer_forward_now(&server->deadlineTimer, ns_to_ktime(server->relDL));
 	return HRTIMER_RESTART;
 }
 
 struct cbs_server *create_cbs_server(struct edf_cbs_rq *rq,
-				     u32 id_unused,
+					 u64 start_instant,
 				     u64 relDL,
 				     u64 capacity)
 {
@@ -201,6 +236,30 @@ struct cbs_server *create_cbs_server(struct edf_cbs_rq *rq,
 
 	list_add_tail(&server->list_node, &rq->servers);
 	rq->server_count++;
+
+	/*
+	 * Initializing the server deadline and capacity.
+	 * Capacity always starts at maximum.
+	 * Deadline, in the paper used as a base for this project,
+	 * starts at instant of creation
+	 */
+
+	server->absDL = start_instant + server->relDL;
+	server->currCapacity = server->maximumCapacity;
+	server->capacity_active = false;
+
+	hrtimer_start(&server->deadlineTimer,
+				ns_to_ktime(server->absDL),
+				HRTIMER_MODE_ABS);
+
+	printk(KERN_INFO
+			"[%llu ms] CBS deadline init: server=%p absDL=%llu relDL=%llu cap=%llu\n",
+			start_instant / 1000000ULL,
+			server,
+			server->absDL,
+			server->relDL,
+			server->currCapacity);
+
 
 	printk(KERN_INFO "MOKER [%d] | create CBS server ID -> [%u] relDL -> [%llu], capacity -> [%llu]\n",
 		current->pid,
@@ -327,5 +386,7 @@ void destroy_cbs_server(struct rq *rq, int id, bool transfer_flag)
 
 	list_del(&server->list_node);
 	edf_rq->server_count--;
+	hrtimer_cancel(&server->capacityTimer);
+	hrtimer_cancel(&server->deadlineTimer);
 	kfree(server);
 }
