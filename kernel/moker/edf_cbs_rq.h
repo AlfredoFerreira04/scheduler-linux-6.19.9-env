@@ -20,7 +20,7 @@ struct cbs_server {
 	u32 id;                     // Unique identifier for bookkeeping
 	struct list_head queue_head; // List of tasks assigned to this server
 	struct task_struct *curr;   // The task currently being served
-	struct list_head list_node; // Link to the list in edf_cbs_rq
+	struct rb_node node;        // Link node for servers rb_tree in edf_cbs_rq
 	u64 relDL;          	/* relative deadline / period */
 	u64 absDL;          	/* absolute deadline */
 
@@ -39,7 +39,7 @@ struct cbs_server {
 struct edf_cbs_rq {
 	struct rb_root tasks_tree;		// EDF priority sorted tree for all tasks
 	struct task_struct *task;	// highest priority task
-	struct list_head servers;   // List of all registered CBS servers
+	struct rb_root servers;     // RB-tree of all registered CBS servers (keyed by id)
 	int server_count;           // Total number of servers
 	raw_spinlock_t lock;		// RQ spinlock for synchronization
 };
@@ -48,6 +48,6 @@ struct edf_cbs_rq {
 void init_edf_cbs_rq(struct edf_cbs_rq *rq);
 struct cbs_server *create_cbs_server(struct edf_cbs_rq *rq, u64 start_instant, u64 relDL, u64 capacity);
 void destroy_cbs_server(struct rq *rq, int id, bool transfer_flag);
-struct cbs_server *lookup_cbs_server(struct edf_cbs_rq *rq, int id);
+struct cbs_server *lookup_assigned_cbs_server(struct edf_cbs_rq *rq, int id);
 
 #endif

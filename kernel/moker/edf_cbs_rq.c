@@ -10,18 +10,56 @@ void init_edf_cbs_rq(struct edf_cbs_rq *rq)
     raw_spin_lock_init(&rq->lock);
     rq->tasks_tree = RB_ROOT;
     rq->task = NULL;
-    INIT_LIST_HEAD(&rq->servers);
+	rq->servers = RB_ROOT;
     rq->server_count = 0;
 }
 
-struct cbs_server *lookup_cbs_server(struct edf_cbs_rq *rq, int id)
+static void insert_server_tree_locked(struct edf_cbs_rq *rq,
+				      struct cbs_server *server)
+{
+	struct rb_node **link = &rq->servers.rb_node;
+	struct rb_node *parent = NULL;
+	struct cbs_server *entry;
+
+	while (*link) {
+		parent = *link;
+		entry = rb_entry(parent, struct cbs_server, node);
+
+		if (server->absDL < entry->absDL)
+			link = &parent->rb_left;
+		else if (server->absDL > entry->absDL)
+			link = &parent->rb_right;
+		else if (server->id < entry->id)
+			link = &parent->rb_left;
+		else
+			link = &parent->rb_right;
+	}
+
+	rb_link_node(&server->node, parent, link);
+	rb_insert_color(&server->node, &rq->servers);
+}
+
+static void reinsert_server_tree_locked(struct edf_cbs_rq *rq,
+					 struct cbs_server *server)
+{
+	if (RB_EMPTY_NODE(&server->node))
+		return;
+
+	rb_erase(&server->node, &rq->servers);
+	RB_CLEAR_NODE(&server->node);
+	insert_server_tree_locked(rq, server);
+}
+
+struct cbs_server *lookup_assigned_cbs_server(struct edf_cbs_rq *rq, int id)
 {
 	struct cbs_server *server;
 
 	if (!rq)
 		return NULL;
 
-	list_for_each_entry(server, &rq->servers, list_node) {
+	for (server = rb_entry_safe(rb_first(&rq->servers), struct cbs_server, node);
+	     server;
+	     server = rb_entry_safe(rb_next(&server->node), struct cbs_server, node)) {
 		if (server->id == id)
 			return server;
 	}
@@ -44,7 +82,7 @@ static enum hrtimer_restart cbs_capacity_timer_fn(struct hrtimer *timer)
 	 * Lock the rq that owns the current CBS task.
 	 *
 	 * If there is no current task, we can only safely touch server state
-	 * if you have another stable way to find the owning rq. In the normal
+	 * if we find another stable way to find the owning rq. In the normal
 	 * capacity-timer case, server->curr should exist.
 	 */
 	p = READ_ONCE(server->curr);
@@ -79,6 +117,7 @@ static enum hrtimer_restart cbs_capacity_timer_fn(struct hrtimer *timer)
 	server->currCapacity = server->maximumCapacity;
 	server->absDL += server->relDL;
 	server->capacity_active = false;
+	reinsert_server_tree_locked(&rq->edf_cbs, server);
 
 	if (!RB_EMPTY_NODE(&p->edf_cbs.node)) {
 		//WARN_ON_ONCE(p->edf_cbs.absDL != server->absDL);
@@ -132,6 +171,7 @@ static enum hrtimer_restart cbs_deadline_timer_fn(struct hrtimer *timer)
 
 	server->currCapacity = server->maximumCapacity;
 	server->absDL += server->relDL;
+	reinsert_server_tree_locked(&rq->edf_cbs, server);
 
 	if (!p) {
 		/* No current task: nothing to reorder on the tree. */
@@ -191,24 +231,12 @@ struct cbs_server *create_cbs_server(struct edf_cbs_rq *rq,
 {
 	struct cbs_server *server;
 	u32 new_id = 0;
-	bool exists;
 
 	if (!rq)
 		return NULL;
 
-	do {
-		struct cbs_server *tmp;
-
-		exists = false;
-
-		list_for_each_entry(tmp, &rq->servers, list_node) {
-			if (tmp->id == new_id) {
-				exists = true;
-				new_id++;
-				break;
-			}
-		}
-	} while (exists);
+	while (lookup_assigned_cbs_server(rq, new_id))
+		new_id++;
 
 	server = kmalloc(sizeof(*server), GFP_ATOMIC);
 	if (!server)
@@ -217,9 +245,9 @@ struct cbs_server *create_cbs_server(struct edf_cbs_rq *rq,
 	server->id = new_id;
 	INIT_LIST_HEAD(&server->queue_head);
 	server->curr = NULL;
-	INIT_LIST_HEAD(&server->list_node);
+	RB_CLEAR_NODE(&server->node);
 	server->relDL = relDL;
-	server->absDL = 0;
+	server->absDL = start_instant + relDL;
 	server->maximumCapacity = capacity;
 	server->currCapacity = capacity;
 	server->rq = container_of(rq, struct rq, edf_cbs);
@@ -234,32 +262,24 @@ struct cbs_server *create_cbs_server(struct edf_cbs_rq *rq,
             CLOCK_MONOTONIC,
             HRTIMER_MODE_ABS);
 
-	list_add_tail(&server->list_node, &rq->servers);
-	rq->server_count++;
-
-	/*
-	 * Initializing the server deadline and capacity.
-	 * Capacity always starts at maximum.
-	 * Deadline, in the paper used as a base for this project,
-	 * starts at instant of creation
-	 */
-
-	server->absDL = start_instant + server->relDL;
-	server->currCapacity = server->maximumCapacity;
 	server->capacity_active = false;
+	server->capacityTimerStart = 0;
 
 	hrtimer_start(&server->deadlineTimer,
-				ns_to_ktime(server->absDL),
-				HRTIMER_MODE_ABS);
+		      ns_to_ktime(server->absDL),
+		      HRTIMER_MODE_ABS);
 
 	printk(KERN_INFO
-			"[%llu ms] CBS deadline init: server=%p absDL=%llu relDL=%llu cap=%llu\n",
-			start_instant / 1000000ULL,
-			server,
-			server->absDL,
-			server->relDL,
-			server->currCapacity);
+		"[%llu ms] CBS deadline create: server=%p id=%u absDL=%llu relDL=%llu cap=%llu\n",
+		start_instant / 1000000ULL,
+		server,
+		server->id,
+		server->absDL,
+		server->relDL,
+		server->currCapacity);
 
+	insert_server_tree_locked(rq, server);
+	rq->server_count++;
 
 	printk(KERN_INFO "MOKER [%d] | create CBS server ID -> [%u] relDL -> [%llu], capacity -> [%llu]\n",
 		current->pid,
@@ -280,26 +300,32 @@ static struct cbs_server *next_transfer_server(struct edf_cbs_rq *edf_rq,
 	if (edf_rq->server_count <= 1)
 		return NULL;
 
-	if (last && last->list_node.next != &edf_rq->servers)
-		server = list_next_entry(last, list_node);
-	else
-		server = list_first_entry(&edf_rq->servers,
-					  struct cbs_server,
-					  list_node);
+	{
+		struct rb_node *n;
 
-	if (server == victim) {
-		if (server->list_node.next != &edf_rq->servers)
-			server = list_next_entry(server, list_node);
+		if (last)
+			n = rb_next(&last->node);
 		else
-			server = list_first_entry(&edf_rq->servers,
-						  struct cbs_server,
-						  list_node);
+			n = rb_first(&edf_rq->servers);
+
+		if (!n)
+			n = rb_first(&edf_rq->servers);
+
+		server = rb_entry(n, struct cbs_server, node);
+
+		if (server == victim) {
+			n = rb_next(n);
+			if (!n)
+				n = rb_first(&edf_rq->servers);
+
+			server = rb_entry(n, struct cbs_server, node);
+		}
+
+		if (server == victim)
+			return NULL;
+
+		return server;
 	}
-
-	if (server == victim)
-		return NULL;
-
-	return server;
 }
 
 
@@ -313,7 +339,7 @@ void destroy_cbs_server(struct rq *rq, int id, bool transfer_flag)
 	if (!edf_rq)
 		return;
 
-	server = lookup_cbs_server(edf_rq, id);
+	server = lookup_assigned_cbs_server(edf_rq, id);
 	if (!server)
 		return;
 
@@ -338,55 +364,46 @@ void destroy_cbs_server(struct rq *rq, int id, bool transfer_flag)
 	}
 
 	if (transfer_flag && edf_rq->server_count > 1) {
-		list_for_each_entry_safe(entry, tmp, &server->queue_head, node) {
-			struct task_struct *p = entry->task;
+        list_for_each_entry_safe(entry, tmp, &server->queue_head, node) {
+            struct task_struct *p = entry->task;
+            list_del(&entry->node);
+            kfree(entry);
+            if (!p)
+                continue;
+            dst = next_transfer_server(edf_rq, server, dst);
+            if (!dst)
+                continue;
+            p->edf_cbs.cbs_server_id = dst->id;
+            /*
+             * These tasks were not on the runqueue.
+             * They are only moved between CBS server FIFOs.
+             */
+            {
+                struct cbs_queue *new_entry;
+                bool was_empty;
+                new_entry = kmalloc(sizeof(*new_entry), GFP_ATOMIC);
+                if (!new_entry)
+                    continue;
+                new_entry->task = p;
+                INIT_LIST_HEAD(&new_entry->node);
+                was_empty = list_empty(&dst->queue_head);
+                list_add_tail(&new_entry->node, &dst->queue_head);
+                if (was_empty && !dst->curr) {
+                    dst->curr = p;
+                    p->edf_cbs.absDL = dst->absDL;
+                }
+            }
+        }
+    } else {
+        list_for_each_entry_safe(entry, tmp, &server->queue_head, node) {
+            list_del(&entry->node);
+            kfree(entry);
+        }
+    }
 
-			list_del(&entry->node);
-			kfree(entry);
-
-			if (!p)
-				continue;
-
-			dst = next_transfer_server(edf_rq, server, dst);
-			if (!dst)
-				continue;
-
-			p->edf_cbs.cbs_server_id = dst->id;
-
-			/*
-			 * These tasks were not on the runqueue.
-			 * They are only moved between CBS server FIFOs.
-			 */
-			{
-				struct cbs_queue *new_entry;
-				bool was_empty;
-
-				new_entry = kmalloc(sizeof(*new_entry), GFP_ATOMIC);
-				if (!new_entry)
-					continue;
-
-				new_entry->task = p;
-				INIT_LIST_HEAD(&new_entry->node);
-
-				was_empty = list_empty(&dst->queue_head);
-				list_add_tail(&new_entry->node, &dst->queue_head);
-
-				if (was_empty && !dst->curr) {
-					dst->curr = p;
-					p->edf_cbs.absDL = dst->absDL;
-				}
-			}
-		}
-	} else {
-		list_for_each_entry_safe(entry, tmp, &server->queue_head, node) {
-			list_del(&entry->node);
-			kfree(entry);
-		}
-	}
-
-	list_del(&server->list_node);
-	edf_rq->server_count--;
-	hrtimer_cancel(&server->capacityTimer);
-	hrtimer_cancel(&server->deadlineTimer);
-	kfree(server);
+    rb_erase(&server->node, &edf_rq->servers);
+    edf_rq->server_count--;
+    hrtimer_cancel(&server->capacityTimer);
+    hrtimer_cancel(&server->deadlineTimer);
+    kfree(server);
 }

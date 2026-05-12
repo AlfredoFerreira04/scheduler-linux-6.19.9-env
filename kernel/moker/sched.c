@@ -55,18 +55,6 @@ void enqueue_hard_rt_task(struct rq *rq, struct task_struct *p)
 	
 	insert_edf_tree(rq, p);
 	update_edf_pick(rq);
-
-	/* If the current running task has a later deadline, request reschedule */
-	if (rq->curr && rq->curr->policy == SCHED_EDF_CBS) {
-		if (rq->curr->edf_cbs.absDL > p->edf_cbs.absDL) {
-			printk(KERN_INFO "EDF preempt: curr_pid=%d curr_absDL=%llu new_pid=%d new_absDL=%llu\n",
-				   rq->curr->pid,
-				   rq->curr->edf_cbs.absDL,
-				   p->pid,
-				   p->edf_cbs.absDL);
-			resched_curr(rq);
-		}
-	}
 }
 
 // WARNING: WHOEVER CALLS THIS FUNCTION MUST HOLD rq->edf_cbs.lock
@@ -76,10 +64,10 @@ void enqueue_soft_rt_task(struct rq *rq, struct task_struct *p)
 	struct cbs_queue *member;
 	bool was_empty;
 
-	server = lookup_cbs_server(&rq->edf_cbs, p->edf_cbs.cbs_server_id);
+	server = lookup_assigned_cbs_server(&rq->edf_cbs, p->edf_cbs.cbs_server_id);
 	if (!server)
 		return;
-
+	
 	p->edf_cbs.absDL = server->absDL;
 
 	/*
@@ -153,6 +141,18 @@ static void enqueue_task_edf_cbs(struct rq *rq, struct task_struct *p, int flags
 	printk(KERN_INFO "=== EDF TREE DUMP AFTER ENQUEUE END ===\n");
 	print_edf_tree(rq);
 	printk(KERN_INFO "=== EDF TREE DUMP AFTER ENQUEUE END ===\n");
+
+	/* If the current running task has a later deadline, request reschedule */
+	if (rq->curr && rq->curr->policy == SCHED_EDF_CBS) {
+		if (rq->curr->edf_cbs.absDL > p->edf_cbs.absDL) {
+			printk(KERN_INFO "EDF preempt: curr_pid=%d curr_absDL=%llu new_pid=%d new_absDL=%llu\n",
+				   rq->curr->pid,
+				   rq->curr->edf_cbs.absDL,
+				   p->pid,
+				   p->edf_cbs.absDL);
+			resched_curr(rq);
+		}
+	}
 
 	raw_spin_unlock(&rq->edf_cbs.lock);
 
@@ -255,7 +255,7 @@ void dequeue_soft_rt_task_edf_cbs(struct rq *rq,
 	struct cbs_server *server;
 	bool was_curr = false;
 
-	server = lookup_cbs_server(&rq->edf_cbs, p->edf_cbs.cbs_server_id);
+	server = lookup_assigned_cbs_server(&rq->edf_cbs, p->edf_cbs.cbs_server_id);
 
 	if (!server) {
 		printk(KERN_INFO
@@ -428,7 +428,7 @@ static void activate_picked_soft_task_locked(struct rq *rq, struct task_struct *
 	if (!p || p->edf_cbs.isHardRT)
 		return;
 
-	server = lookup_cbs_server(&rq->edf_cbs, p->edf_cbs.cbs_server_id);
+	server = lookup_assigned_cbs_server(&rq->edf_cbs, p->edf_cbs.cbs_server_id);
 	if (!server) {
 		printk(KERN_WARNING
 		       "MOKER: soft task %u could not find server %u\n",
@@ -493,11 +493,21 @@ static struct task_struct *pick_task_edf_cbs(struct rq *rq, struct rq_flags *rf)
     update_edf_pick(rq);  // optional
     task = rq->edf_cbs.task;
 
+	/* If current task is a soft task, release it before switching away */
+	if (rq->curr != task && rq->curr && rq->curr->policy == SCHED_EDF_CBS &&
+	    !rq->curr->edf_cbs.isHardRT) {
+        struct cbs_server *prev_server = lookup_assigned_cbs_server(&rq->edf_cbs,
+                                                            rq->curr->edf_cbs.cbs_server_id);
+        if (prev_server) {
+            release_soft_task_locked(prev_server);
+        }
+    }
+
     if (task && !task->edf_cbs.isHardRT) {
         activate_picked_soft_task_locked(rq, task);
 
         // safely get currCapacity for soft tasks
-        struct cbs_server *server = lookup_cbs_server(&rq->edf_cbs,
+        struct cbs_server *server = lookup_assigned_cbs_server(&rq->edf_cbs,
                                                        task->edf_cbs.cbs_server_id);
         if (server)
             curr_cap = server->currCapacity;
@@ -538,7 +548,7 @@ static struct task_struct *pick_next_task_edf_cbs(struct rq *rq,
 
 	if (task && !task->edf_cbs.isHardRT) {
 		soft = true;
-		server = lookup_cbs_server(&rq->edf_cbs,
+		server = lookup_assigned_cbs_server(&rq->edf_cbs,
 					   task->edf_cbs.cbs_server_id);
 
 		if (server)

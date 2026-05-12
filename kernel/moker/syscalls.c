@@ -100,7 +100,7 @@ int do_delay_edf_cbs_task_until_next_T(void)
 			now_before_account = ktime_get_ns();
 			rq = task_rq_lock(current, &rf);
 
-			server = lookup_cbs_server(&rq->edf_cbs,
+			server = lookup_assigned_cbs_server(&rq->edf_cbs,
 						   current->edf_cbs.cbs_server_id);
 
 			if (server && server->curr == current) {
@@ -284,7 +284,7 @@ int do_setup_moker_edf_cbs_soft_task(u32 server_id, u32 task_id, u64 startInstan
 
 	rq = task_rq_lock(current, &rf);
 
-	server = lookup_cbs_server(&rq->edf_cbs, server_id);
+	server = lookup_assigned_cbs_server(&rq->edf_cbs, server_id);
 	if (!server) {
 		task_rq_unlock(rq, current, &rf);
 		return -EINVAL;
@@ -328,7 +328,7 @@ int do_destroy_moker_cbs_server(u32 server_id)
 
 	raw_spin_lock(&rq->edf_cbs.lock);
 
-	server = lookup_cbs_server(&rq->edf_cbs, server_id);
+	server = lookup_assigned_cbs_server(&rq->edf_cbs, server_id);
 	if (!server) {
 		raw_spin_unlock(&rq->edf_cbs.lock);
 		return -ENOENT;
@@ -370,7 +370,7 @@ int do_destroy_moker_cbs_server(u32 server_id)
 		kfree(entry);
 	}
 
-	list_del(&server->list_node);
+	rb_erase(&server->node, &rq->edf_cbs.servers);
 
 	raw_spin_unlock(&rq->edf_cbs.lock);
 
