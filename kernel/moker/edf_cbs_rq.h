@@ -23,6 +23,7 @@ struct cbs_server {
 	struct rb_node node;        // Link node for servers rb_tree in edf_cbs_rq
 	u64 relDL;          	/* relative deadline / period */
 	u64 absDL;          	/* absolute deadline */
+	u32 utilization;     	/* percentage in [1..99], representing U in ]0,1[ */
 
 	struct rq *rq;
 	
@@ -46,7 +47,9 @@ struct edf_cbs_rq {
 
 /* Function Prototypes */
 void init_edf_cbs_rq(struct edf_cbs_rq *rq);
-struct cbs_server *create_cbs_server(struct edf_cbs_rq *rq, u64 start_instant, u64 relDL, u64 capacity);
+struct cbs_server *create_cbs_server(struct edf_cbs_rq *rq, u64 start_instant, u64 relDL,
+				     u64 capacity, u32 utilization);
+void reinsert_cbs_server_tree_locked(struct edf_cbs_rq *rq, struct cbs_server *server);
 void destroy_cbs_server(struct rq *rq, int id, bool transfer_flag);
 struct cbs_server *lookup_assigned_cbs_server(struct edf_cbs_rq *rq, int id);
 

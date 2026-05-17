@@ -72,7 +72,20 @@ int do_delay_edf_cbs_task_until_next_T(void)
 			ktime_t now = ktime_get();
 			ktime_t expires = ns_to_ktime(current->edf_cbs.absDL);
 
+			 /* Hard RT:
+			  * Sleep until the next period deadline, without accounting or
+			  * releasing CBS server ownership. This is a hard delay, as the
+			  * task keeps its current scheduling priority and remains at the
+			  * head of its server's queue if it has one.
+			  */
 			refresh_task_deadline(current);
+			printk(KERN_INFO
+				"hard delay after refresh id=%u nextT=%llu absDL=%llu now=%llu delta_ms=%lld\n",
+				current->edf_cbs.id,
+				ktime_to_ns(expires),
+				current->edf_cbs.absDL,
+				ktime_get_ns(),
+				(s64)(current->edf_cbs.absDL - ktime_get_ns()) / 1000000);
 
 			if (ktime_compare(expires, now) <= 0) {
 				current->edf_cbs.deadlineUpdate = true;
@@ -163,6 +176,14 @@ int do_delay_edf_cbs_task_until_next_T(void)
 			 * scheduling priority remains server-deadline based.
 			 */
 			refresh_task_period(current);
+			printk(KERN_INFO
+				"soft delay after refresh id=%u absT=%llu absDL=%llu now=%llu deltaT_ms=%lld deltaDL_ms=%lld\n",
+				current->edf_cbs.id,
+				current->edf_cbs.absT,
+				current->edf_cbs.absDL,
+				ktime_get_ns(),
+				(s64)(current->edf_cbs.absT - ktime_get_ns()) / 1000000,
+				(s64)(current->edf_cbs.absDL - ktime_get_ns()) / 1000000);
 
 			expires = ns_to_ktime(current->edf_cbs.absT);
 			printk(KERN_INFO
@@ -226,12 +247,13 @@ int do_delay_edf_cbs_task_until_next_T(void)
 }
 
 
-SYSCALL_DEFINE3(create_moker_cbs_server, u64, relDL, u64, capacity, u64, start_instant)
+SYSCALL_DEFINE4(create_moker_cbs_server, u64, relDL, u64, capacity, u64, start_instant,
+		u32, utilization)
 {
-	return do_create_moker_cbs_server(relDL, capacity, start_instant);
+	return do_create_moker_cbs_server(relDL, capacity, start_instant, utilization);
 }
 
-long do_create_moker_cbs_server(u64 relDL, u64 capacity, u64 start_instant)
+long do_create_moker_cbs_server(u64 relDL, u64 capacity, u64 start_instant, u32 utilization)
 {
 #ifdef CONFIG_MOKER_EDF_CBS_POLICY
 	struct rq *rq;
@@ -239,9 +261,12 @@ long do_create_moker_cbs_server(u64 relDL, u64 capacity, u64 start_instant)
 	struct cbs_server *server;
 	int id;
 
+	if (utilization == 0 || utilization >= 100)
+		return -EINVAL;
+
 	rq = task_rq_lock(current, &rf);
 
-	server = create_cbs_server(&rq->edf_cbs, start_instant, relDL, capacity);
+	server = create_cbs_server(&rq->edf_cbs, start_instant, relDL, capacity, utilization);
 	if (!server) {
 		task_rq_unlock(rq, current, &rf);
 		return -ENOMEM;
@@ -296,7 +321,7 @@ int do_setup_moker_edf_cbs_soft_task(u32 server_id, u32 task_id, u64 startInstan
 
 	RB_CLEAR_NODE(&sched_entity->node);
 	sched_entity->startInstant = startInstant;
-	sched_entity->absT = startInstant + relDL;
+	sched_entity->absT = startInstant;
 	sched_entity->relDL = relDL;              /* task period/timekeeping */
 	sched_entity->absDL = server_absDL;       /* CBS scheduling deadline */
 	sched_entity->deadlineUpdate = false;

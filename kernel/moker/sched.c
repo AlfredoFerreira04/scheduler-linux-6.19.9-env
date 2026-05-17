@@ -63,6 +63,8 @@ void enqueue_soft_rt_task(struct rq *rq, struct task_struct *p)
 	struct cbs_server *server;
 	struct cbs_queue *member;
 	bool was_empty;
+	u64 arrival_plus_c_over_u;
+	u64 c_over_u;
 
 	server = lookup_assigned_cbs_server(&rq->edf_cbs, p->edf_cbs.cbs_server_id);
 	if (!server)
@@ -80,6 +82,39 @@ void enqueue_soft_rt_task(struct rq *rq, struct task_struct *p)
 	}
 
 	was_empty = list_empty(&server->queue_head) && server->curr == NULL;
+
+	/*
+	 * CBS idle-arrival rule:
+	 * if startInstant + (currCapacity / utilization) <= absDL,
+	 * do nothing.
+	 * Otherwise, push absDL by relDL and refill capacity immediately.
+	 *
+	 * utilization is stored as a percentage in ]0,1[ => [1..99].
+	 * So: currCapacity / U == currCapacity / (utilization/100)
+	 *                     == currCapacity * 100 / utilization.
+	 * Applies only when the server is currently idle.
+	 */
+	if (was_empty) {
+		c_over_u = div64_u64(server->currCapacity,
+					 server->utilization);
+		arrival_plus_c_over_u = p->edf_cbs.startInstant + c_over_u;
+
+		if (arrival_plus_c_over_u > server->absDL) {
+			server->absDL += server->relDL;
+			server->currCapacity = server->maximumCapacity;
+			reinsert_cbs_server_tree_locked(&rq->edf_cbs, server);
+
+			printk(KERN_INFO
+			       "soft enqueue idle jump task=%u server=%u start=%llu c_over_u=%llu newAbsDL=%llu refilledCap=%llu util=%u\n",
+			       p->edf_cbs.id,
+			       server->id,
+			       p->edf_cbs.startInstant,
+			       c_over_u,
+			       server->absDL,
+			       server->currCapacity,
+			       server->utilization);
+		}
+	}
 
 	/*
 	 * If this server is idle and has capacity, promote directly.

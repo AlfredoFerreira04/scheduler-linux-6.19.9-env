@@ -50,6 +50,12 @@ static void reinsert_server_tree_locked(struct edf_cbs_rq *rq,
 	insert_server_tree_locked(rq, server);
 }
 
+void reinsert_cbs_server_tree_locked(struct edf_cbs_rq *rq,
+					struct cbs_server *server)
+{
+	reinsert_server_tree_locked(rq, server);
+}
+
 struct cbs_server *lookup_assigned_cbs_server(struct edf_cbs_rq *rq, int id)
 {
 	struct cbs_server *server;
@@ -109,6 +115,7 @@ static enum hrtimer_restart cbs_capacity_timer_fn(struct hrtimer *timer)
 	 * - replenish capacity
 	 * - push server deadline
 	 * - update current soft task deadline
+	 * - reschedule deadline timer to new deadline
 	 *
 	 * If the task is currently in the EDF tree, remove-and-reinsert
 	 * under the rq/edf_cbs lock to update its sort key atomically and
@@ -117,6 +124,16 @@ static enum hrtimer_restart cbs_capacity_timer_fn(struct hrtimer *timer)
 	server->currCapacity = server->maximumCapacity;
 	server->absDL += server->relDL;
 	server->capacity_active = false;
+	/*
+	 * Reschedule the deadline timer to the new absolute deadline.
+	 * Use hrtimer_start in ABS mode with the absolute ktime to avoid
+	 * treating `server->absDL` as a relative interval (which
+	 * hrtimer_forward_now expects).
+	 */
+	
+	hrtimer_start(&server->deadlineTimer,
+			 ns_to_ktime(server->absDL),
+			 HRTIMER_MODE_ABS);
 	reinsert_server_tree_locked(&rq->edf_cbs, server);
 
 	if (!RB_EMPTY_NODE(&p->edf_cbs.node)) {
@@ -227,7 +244,8 @@ static enum hrtimer_restart cbs_deadline_timer_fn(struct hrtimer *timer)
 struct cbs_server *create_cbs_server(struct edf_cbs_rq *rq,
 					 u64 start_instant,
 				     u64 relDL,
-				     u64 capacity)
+				     u64 capacity,
+				     u32 utilization)
 {
 	struct cbs_server *server;
 	u32 new_id = 0;
@@ -248,6 +266,7 @@ struct cbs_server *create_cbs_server(struct edf_cbs_rq *rq,
 	RB_CLEAR_NODE(&server->node);
 	server->relDL = relDL;
 	server->absDL = start_instant + relDL;
+	server->utilization = utilization;
 	server->maximumCapacity = capacity;
 	server->currCapacity = capacity;
 	server->rq = container_of(rq, struct rq, edf_cbs);
@@ -270,22 +289,24 @@ struct cbs_server *create_cbs_server(struct edf_cbs_rq *rq,
 		      HRTIMER_MODE_ABS);
 
 	printk(KERN_INFO
-		"[%llu ms] CBS deadline create: server=%p id=%u absDL=%llu relDL=%llu cap=%llu\n",
+		"[%llu ms] CBS deadline create: server=%p id=%u absDL=%llu relDL=%llu cap=%llu util=%u%%\n",
 		start_instant / 1000000ULL,
 		server,
 		server->id,
 		server->absDL,
 		server->relDL,
-		server->currCapacity);
+		server->currCapacity,
+		server->utilization);
 
 	insert_server_tree_locked(rq, server);
 	rq->server_count++;
 
-	printk(KERN_INFO "MOKER [%d] | create CBS server ID -> [%u] relDL -> [%llu], capacity -> [%llu]\n",
+	printk(KERN_INFO "MOKER [%d] | create CBS server ID -> [%u] relDL -> [%llu], capacity -> [%llu], utilization -> [%u]\n",
 		current->pid,
 		(u32)server->id,
 		(u64)relDL,
-		(u64)capacity);
+		(u64)capacity,
+		server->utilization);
 
 
 	return server;
