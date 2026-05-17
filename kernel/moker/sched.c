@@ -5,6 +5,10 @@
 
 
 // WARNING: WHOEVER CALLS THIS FUNCTION MUST HOLD rq->edf_cbs.lock
+/*
+ * print_edf_tree - dump EDF tree contents for debugging
+ * Prints each task's id, pid, deadline and state in the EDF tree.
+ */
 void print_edf_tree(struct rq *rq)
 {
     struct rb_node *node;
@@ -21,10 +25,15 @@ void print_edf_tree(struct rq *rq)
 
 }
 
+/*
+ * activate_soft_task_in_tree_locked - make a soft task runnable under EDF
+ * Set the task's scheduling deadline (server's absDL), insert it into the
+ * EDF tree if needed and refresh the pick. Caller must hold rq->edf_cbs.lock.
+ */
 static void activate_soft_task_in_tree_locked(struct rq *rq,
-					      struct task_struct *p,
-					      struct cbs_server *server,
-					      const char *action)
+					  struct task_struct *p,
+					  struct cbs_server *server,
+					  const char *action)
 {
 	p->edf_cbs.absDL = server->absDL;
 
@@ -44,6 +53,10 @@ static void activate_soft_task_in_tree_locked(struct rq *rq,
 }
 
 // WARNING: WHOEVER CALLS THIS FUNCTION MUST HOLD rq->edf_cbs.lock
+/*
+ * enqueue_hard_rt_task - enqueue a hard real-time task into EDF tree
+ * Inserts the task into the EDF rbtree and updates the runqueue pick.
+ */
 void enqueue_hard_rt_task(struct rq *rq, struct task_struct *p)
 {
 	printk(KERN_INFO
@@ -58,6 +71,10 @@ void enqueue_hard_rt_task(struct rq *rq, struct task_struct *p)
 }
 
 // WARNING: WHOEVER CALLS THIS FUNCTION MUST HOLD rq->edf_cbs.lock
+/*
+ * enqueue_soft_rt_task - enqueue or queue a soft CBS task
+ * Handles idle-arrival rules, possible immediate promotion, or FIFO enqueue.
+ */
 void enqueue_soft_rt_task(struct rq *rq, struct task_struct *p)
 {
 	struct cbs_server *server;
@@ -102,6 +119,11 @@ void enqueue_soft_rt_task(struct rq *rq, struct task_struct *p)
 		if (arrival_plus_c_over_u > server->absDL) {
 			server->absDL += server->relDL;
 			server->currCapacity = server->maximumCapacity;
+
+			/*
+			 * This function call will update the server's position in the server RB-tree if needed,
+			 * it doesn't do much now but if we implement CASH it will be useful, just thinking ahead.			 
+			*/
 			reinsert_cbs_server_tree_locked(&rq->edf_cbs, server);
 
 			printk(KERN_INFO
@@ -117,11 +139,11 @@ void enqueue_soft_rt_task(struct rq *rq, struct task_struct *p)
 	}
 
 	/*
-	 * If this server is idle and has capacity, promote directly.
+	 * If this server is idle then promote directly.
 	 * This makes the task the server owner immediately, instead of
 	 * putting it behind the FIFO queue.
 	 */
-	if (was_empty && server->currCapacity > 0) {
+	if (was_empty) {
 		server->curr = p;
 		activate_soft_task_in_tree_locked(rq, p, server, "promoted");
 
@@ -129,18 +151,14 @@ void enqueue_soft_rt_task(struct rq *rq, struct task_struct *p)
 	}
 
 	/*
-	 * Otherwise wait behind the current CBS task or wait for capacity.
+	 * Otherwise, enqueue into the server FIFO. The task will be promoted when it
+	 * reaches the head of the FIFO naturally.
 	 */
 	member = kmalloc(sizeof(*member), GFP_ATOMIC);
 	if (!member) {
 		printk(KERN_ERR "[CRITICAL] MOKER: failed to allocate memory for FIFO member for task %u\n", p->edf_cbs.id);
 		return;
 	}
-
-	/*
-	 * No immediate capacity or ownership, so the task stays queued until
-	 * the active CBS owner blocks, yields, or runs out of budget.
-	 */
 	member->task = p;
 	INIT_LIST_HEAD(&member->node);
 	list_add_tail(&member->node, &server->queue_head);
@@ -159,6 +177,11 @@ void enqueue_soft_rt_task(struct rq *rq, struct task_struct *p)
 }
 
 // This wrapper acquires rq->edf_cbs.lock before dispatching to the per-task enqueue helpers.
+/*
+ * enqueue_task_edf_cbs - scheduler entry point for enqueueing EDF tasks
+ * Grabs the edf_cbs lock, calls the appropriate enqueue helper, and
+ * triggers tracing/reschedule checks.
+ */
 static void enqueue_task_edf_cbs(struct rq *rq, struct task_struct *p, int flags)
 {	
 
@@ -197,6 +220,10 @@ static void enqueue_task_edf_cbs(struct rq *rq, struct task_struct *p, int flags
 }
 
 // WARNING: WHOEVER CALLS THIS FUNCTION MUST HOLD rq->edf_cbs.lock
+/*
+ * dequeue_hard_rt_task_edf_cbs - remove hard RT task from EDF tree
+ * Erases the rbtree node and updates runqueue accounting.
+ */
 void dequeue_hard_rt_task_edf_cbs(struct rq *rq, struct task_struct *p)
 {
 	if (!RB_EMPTY_NODE(&p->edf_cbs.node)) {
@@ -206,6 +233,10 @@ void dequeue_hard_rt_task_edf_cbs(struct rq *rq, struct task_struct *p)
 	}
 }
 
+/*
+ * dump_soft_queue_locked - log members of a server FIFO (debug)
+ * Iterates the server FIFO and prints each queued member's summary.
+ */
 static void dump_soft_queue_locked(struct cbs_server *server)
 {
 	struct cbs_queue *entry;
@@ -221,6 +252,10 @@ static void dump_soft_queue_locked(struct cbs_server *server)
 	}
 }
 
+/*
+ * release_soft_task_locked - stop budget timer and release server owner
+ * Cancels capacity timer accounting and clears server->curr.
+ */
 static void release_soft_task_locked(struct cbs_server *server)
 {
 	ktime_t end;
@@ -252,6 +287,11 @@ static void release_soft_task_locked(struct cbs_server *server)
 	server->curr = NULL;
 }
 
+/*
+ * promote_next_soft_task_locked - promote first FIFO waiting task to server owner
+ * Removes first entry from the FIFO, makes it the server owner and inserts
+ * it into the EDF tree.
+ */
 static void promote_next_soft_task_locked(struct rq *rq, struct cbs_server *server)
 {
 	struct cbs_queue *next_entry;
@@ -282,10 +322,15 @@ static void promote_next_soft_task_locked(struct rq *rq, struct cbs_server *serv
 }
 
 // WARNING: WHOEVER CALLS THIS FUNCTION MUST HOLD rq->edf_cbs.lock
+/*
+ * dequeue_soft_rt_task_edf_cbs - dequeue a soft CBS task
+ * Handles deadline updates vs real release, charges budget, and promotes
+ * the next FIFO waiter when appropriate.
+ */
 void dequeue_soft_rt_task_edf_cbs(struct rq *rq,
-				     struct task_struct *p,
-				     int flags,
-				     bool deadline_update)
+					 struct task_struct *p,
+					 int flags,
+					 bool deadline_update)
 {
 	struct cbs_server *server;
 	bool was_curr = false;
@@ -381,6 +426,11 @@ void dequeue_soft_rt_task_edf_cbs(struct rq *rq,
 	}
 }
 
+/*
+ * dequeue_task_edf_cbs - scheduler dequeue wrapper for EDF tasks
+ * Grabs the edf_cbs lock, dispatches to soft/hard dequeue helpers and
+ * updates the EDF pick.
+ */
 static bool dequeue_task_edf_cbs(struct rq *rq, struct task_struct *p, int flags)
 {
 	bool deadline_update = flags & DEQUEUE_UPDATE_DEADLINE;
@@ -419,20 +469,36 @@ static bool dequeue_task_edf_cbs(struct rq *rq, struct task_struct *p, int flags
 	return true;
 }
 
+/*
+ * yield_task_edf_cbs - handle a task voluntarily yielding the CPU
+ * Requests a reschedule so a different task can run.
+ */
 static void yield_task_edf_cbs(struct rq *rq)
 {
 	resched_curr(rq);
 }
 
+/*
+ * yield_to_task_edf_cbs - attempt to yield to a specific task (not used)
+ * Returns false; explicit yield-to is unsupported in this policy.
+ */
 static bool yield_to_task_edf_cbs(struct rq *rq, struct task_struct *p)
 {
 	return false;
 }
 
+/*
+ * task_tick_edf_cbs - per-tick bookkeeping for EDF tasks (noop)
+ * Placeholder for periodic updates (unused here).
+ */
 static void task_tick_edf_cbs(struct rq *rq, struct task_struct *p, int queued)
 {
 }
 
+/*
+ * wakeup_preempt_edf_cbs - handle wakeups that may preempt current task
+ * Triggers reschedule if the woken task has an earlier deadline.
+ */
 static void wakeup_preempt_edf_cbs(struct rq *rq, struct task_struct *p, int flags)
 {
 	struct task_struct *curr = rq->curr;
@@ -449,11 +515,19 @@ static void wakeup_preempt_edf_cbs(struct rq *rq, struct task_struct *p, int fla
 		resched_curr(rq);
 }
 
+/*
+ * balance_edf_cbs - CPU load balancing hook (no-op)
+ * Returns 0; this policy does not implement load balancing here.
+ */
 static int balance_edf_cbs(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 {
 	return 0;
 }
 
+/*
+ * activate_picked_soft_task_locked - arm capacity timer for picked soft task
+ * Ensures the server budget timer is started for the task when selected.
+ */
 static void activate_picked_soft_task_locked(struct rq *rq, struct task_struct *p)
 {
 	struct cbs_server *server;
@@ -518,6 +592,11 @@ static void activate_picked_soft_task_locked(struct rq *rq, struct task_struct *
 	       server->absDL);
 }
 
+/*
+ * pick_task_edf_cbs - pick the currently highest-priority EDF task
+ * Returns the task chosen from the EDF tree and handles soft-task release
+ * bookkeeping for the previous owner.
+ */
 static struct task_struct *pick_task_edf_cbs(struct rq *rq, struct rq_flags *rf)
 {
     struct task_struct *task;
@@ -528,7 +607,7 @@ static struct task_struct *pick_task_edf_cbs(struct rq *rq, struct rq_flags *rf)
     update_edf_pick(rq);  // optional
     task = rq->edf_cbs.task;
 
-	/* If current task is a soft task, release it before switching away */
+	/* If current task is a soft task, cancel it's capacity timer */
 	if (rq->curr != task && rq->curr && rq->curr->policy == SCHED_EDF_CBS &&
 	    !rq->curr->edf_cbs.isHardRT) {
         struct cbs_server *prev_server = lookup_assigned_cbs_server(&rq->edf_cbs,
@@ -561,6 +640,10 @@ static struct task_struct *pick_task_edf_cbs(struct rq *rq, struct rq_flags *rf)
     return task;
 }
 
+/*
+ * pick_next_task_edf_cbs - pick next task during a context switch
+ * Similar to pick_task but runs on the switch path and may activate soft task
+ */
 static struct task_struct *pick_next_task_edf_cbs(struct rq *rq,
 						  struct task_struct *prev,
 						  struct rq_flags *rf)
@@ -606,6 +689,10 @@ static struct task_struct *pick_next_task_edf_cbs(struct rq *rq,
 	return task;
 }
 
+/*
+ * put_prev_task_edf_cbs - placeholder for cleaning up previous task
+ * Currently empty; kept for API completeness.
+ */
 static void put_prev_task_edf_cbs(struct rq *rq,
 				  struct task_struct *p,
 				  struct task_struct *next)
@@ -613,43 +700,77 @@ static void put_prev_task_edf_cbs(struct rq *rq,
 	
 }
 
+/*
+ * set_next_task_edf_cbs - placeholder to set next task state
+ * No-op in this policy; provided for scheduler API compatibility.
+ */
 static void set_next_task_edf_cbs(struct rq *rq,
 				  struct task_struct *p,
 				  bool first)
 {
 }
 
+/*
+ * select_task_rq_edf_cbs - choose target CPU for a task (single-cpu)
+ * Returns the same CPU; migration not altered by this policy.
+ */
 static int select_task_rq_edf_cbs(struct task_struct *p, int cpu, int flags)
 {
 	return cpu;
 }
 
+/*
+ * switching_from_edf_cbs - pre-switch hook (noop)
+ * Called when switching away from an EDF task; no action required here.
+ */
 static void switching_from_edf_cbs(struct rq *this_rq, struct task_struct *task)
 {
 }
 
+/*
+ * switching_to_edf_cbs - post-switch hook (noop)
+ * Called when switching to an EDF task; no action required here.
+ */
 static void switching_to_edf_cbs(struct rq *this_rq, struct task_struct *task)
 {
 }
 
+/*
+ * switched_from_edf_cbs - hook after switched from (noop)
+ */
 static void switched_from_edf_cbs(struct rq *this_rq, struct task_struct *task)
 {
 }
 
+/*
+ * switched_to_edf_cbs - hook after switched to (noop)
+ */
 static void switched_to_edf_cbs(struct rq *this_rq, struct task_struct *task)
 {
 }
 
+/*
+ * reweight_task_edf_cbs - adjust task weight (unused)
+ * Provided for API compatibility; no reweighting performed here.
+ */
 static void reweight_task_edf_cbs(struct rq *this_rq,
 				  struct task_struct *task,
 				  const struct load_weight *lw)
 {
 }
 
+/*
+ * prio_changed_edf_cbs - handle priority change (unused)
+ * No action taken on priority change for this policy.
+ */
 static void prio_changed_edf_cbs(struct rq *rq, struct task_struct *p, u64 oldprio)
 {
 }
 
+/*
+ * update_curr_edf_cbs - periodic current-task update (noop)
+ * Called to update the current task's accounting; not used here.
+ */
 static void update_curr_edf_cbs(struct rq *rq)
 {
 }

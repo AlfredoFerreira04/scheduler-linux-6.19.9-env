@@ -117,17 +117,15 @@ int do_delay_edf_cbs_task_until_next_T(void)
 						   current->edf_cbs.cbs_server_id);
 
 			if (server && server->curr == current) {
+				
+				/* Subtracts consumed CBS runtime from capacity */
 				account_cbs_runtime(server);
-				printk(KERN_INFO
-					"soft delay after account server=%u from=%u cap=%llu active=%d start=%llu curr=%u consumed_span=%llu now_ms=%llu\n",
+				
+				printk(KERN_DEBUG "MOKER: soft delay account server=%u task=%u cap=%llu consumed_span_ns=%llu\n",
 					server->id,
 					current->edf_cbs.id,
 					server->currCapacity,
-					server->capacity_active ? 1 : 0,
-					server->capacityTimerStart,
-					server->curr ? server->curr->edf_cbs.id : 0,
-					now_before_account - server->capacityTimerStart,
-					now_before_account / 1000000ULL);
+					now_before_account - server->capacityTimerStart);
 
 				if (!RB_EMPTY_NODE(&current->edf_cbs.node)) {
 					rb_erase(&current->edf_cbs.node, &rq->edf_cbs.tasks_tree);
@@ -176,23 +174,12 @@ int do_delay_edf_cbs_task_until_next_T(void)
 			 * scheduling priority remains server-deadline based.
 			 */
 			refresh_task_period(current);
-			printk(KERN_INFO
-				"soft delay after refresh id=%u absT=%llu absDL=%llu now=%llu deltaT_ms=%lld deltaDL_ms=%lld\n",
+			printk(KERN_DEBUG "MOKER: soft delay refreshed id=%u absT=%llu absDL=%llu\n",
 				current->edf_cbs.id,
 				current->edf_cbs.absT,
-				current->edf_cbs.absDL,
-				ktime_get_ns(),
-				(s64)(current->edf_cbs.absT - ktime_get_ns()) / 1000000,
-				(s64)(current->edf_cbs.absDL - ktime_get_ns()) / 1000000);
+				current->edf_cbs.absDL);
 
 			expires = ns_to_ktime(current->edf_cbs.absT);
-			printk(KERN_INFO
-				"soft delay post-refresh id=%u absT=%llu now=%llu delta_ms=%lld\n",
-				current->edf_cbs.id,
-				current->edf_cbs.absT,
-				ktime_get_ns(),
-				(s64)(current->edf_cbs.absT - ktime_get_ns()) / 1000000);
-
 			now = ktime_get();
 			if (ktime_compare(expires, now) <= 0) {
 				printk(KERN_INFO
@@ -214,11 +201,6 @@ int do_delay_edf_cbs_task_until_next_T(void)
 			set_current_state(TASK_INTERRUPTIBLE);
 			schedule_hrtimeout(&expires, HRTIMER_MODE_ABS);
 			__set_current_state(TASK_RUNNING);
-			printk(KERN_INFO
-				"soft delay woken id=%u now=%llu state=%u\n",
-				current->edf_cbs.id,
-				ktime_get_ns() / 1000000ULL,
-				READ_ONCE(current->__state));
 
 		{
 
@@ -227,16 +209,14 @@ int do_delay_edf_cbs_task_until_next_T(void)
 			s64 deltaT = (s64)(current->edf_cbs.absT - now_ns);
 			s64 deltaDL = (s64)(current->edf_cbs.absDL - now_ns);
 
-			printk(KERN_INFO
-				"soft delay return id=%u server=%u now=%llu absT=%llu absDL=%llu deltaT=%lld deltaDL=%lld state=%u\n",
+			printk(KERN_DEBUG "MOKER: soft delay return id=%u server=%u absT=%llu absDL=%llu state=%u deltaT=%lld deltaDL=%lld\n",
 				current->edf_cbs.id,
 				current->edf_cbs.cbs_server_id,
-				now_ns,
 				current->edf_cbs.absT,
 				current->edf_cbs.absDL,
+				READ_ONCE(current->__state),
 				deltaT,
-				deltaDL,
-				READ_ONCE(current->__state));
+				deltaDL);
 		}
 
 			return 0;
