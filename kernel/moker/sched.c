@@ -1,5 +1,7 @@
 #include "../sched/sched.h"
 #include "utils.h"
+#include <linux/hrtimer.h>
+#include <linux/ktime.h>
 
 #define DEQUEUE_UPDATE_DEADLINE 0x10000000
 
@@ -112,6 +114,28 @@ void enqueue_soft_rt_task(struct rq *rq, struct task_struct *p)
 	 * Applies only when the server is currently idle.
 	 */
 	if (was_empty) {
+		/* If the server is idle and the deadline timer is not active,
+		 * start the server absolute deadline at the task's startInstant
+		 * + server->relDL and arm the deadline timer. This initializes
+		 * the server deadline on first arrival.
+		 */
+		if (!hrtimer_active(&server->deadlineTimer)) {
+			server->absDL = p->edf_cbs.startInstant + server->relDL;
+			server->currCapacity = server->maximumCapacity;
+			reinsert_cbs_server_tree_locked(&rq->edf_cbs, server);
+			hrtimer_start(&server->deadlineTimer,
+						  ns_to_ktime(server->absDL),
+						  HRTIMER_MODE_ABS);
+			printk(KERN_INFO
+				   "soft enqueue first-arrival arm timer task=%u server=%u start=%llu absDL=%llu cap=%llu util=%u\n",
+				   p->edf_cbs.id,
+				   server->id,
+				   p->edf_cbs.startInstant,
+				   server->absDL,
+				   server->currCapacity,
+				   server->utilization);
+		}
+
 		c_over_u = div64_u64(server->currCapacity,
 					 server->utilization);
 		arrival_plus_c_over_u = p->edf_cbs.startInstant + c_over_u;
@@ -121,20 +145,19 @@ void enqueue_soft_rt_task(struct rq *rq, struct task_struct *p)
 			server->currCapacity = server->maximumCapacity;
 
 			/*
-			 * This function call will update the server's position in the server RB-tree if needed,
-			 * it doesn't do much now but if we implement CASH it will be useful, just thinking ahead.			 
-			*/
+			 * This function call will update the server's position in the server RB-tree if needed.
+			 */
 			reinsert_cbs_server_tree_locked(&rq->edf_cbs, server);
 
 			printk(KERN_INFO
-			       "soft enqueue idle jump task=%u server=%u start=%llu c_over_u=%llu newAbsDL=%llu refilledCap=%llu util=%u\n",
-			       p->edf_cbs.id,
-			       server->id,
-			       p->edf_cbs.startInstant,
-			       c_over_u,
-			       server->absDL,
-			       server->currCapacity,
-			       server->utilization);
+				   "soft enqueue idle jump task=%u server=%u start=%llu c_over_u=%llu newAbsDL=%llu refilledCap=%llu util=%u\n",
+				   p->edf_cbs.id,
+				   server->id,
+				   p->edf_cbs.startInstant,
+				   c_over_u,
+				   server->absDL,
+				   server->currCapacity,
+				   server->utilization);
 		}
 	}
 

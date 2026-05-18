@@ -190,17 +190,8 @@ static enum hrtimer_restart cbs_deadline_timer_fn(struct hrtimer *timer)
 	server->absDL += server->relDL;
 	reinsert_server_tree_locked(&rq->edf_cbs, server);
 
-	if (!p) {
-		/* No current task: nothing to reorder on the tree. */
-		printk(KERN_INFO
-			   "[%llu ms] CBS deadline recharge (no curr): server=%u cap=%llu absDL=%llu\n",
-			   ktime_get_ns() / 1000000ULL,
-			   server->id,
-			   server->currCapacity,
-			   server->absDL);
-
-		hrtimer_forward_now(&server->deadlineTimer, ns_to_ktime(server->relDL));
-		return HRTIMER_RESTART;
+	if (!p && list_empty(&server->queue_head)) {
+		return HRTIMER_NORESTART;
 	}
 
 	rq = task_rq_lock(p, &rf);
